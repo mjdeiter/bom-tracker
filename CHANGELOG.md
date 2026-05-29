@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.2.0] - 2026-05-29
+
+### Added
+- **Print BOM** — toolbar button and Project menu item that generate a print-ready HTML file
+  for the selected project and open it in the default browser. The page auto-triggers
+  `window.print()` on load, shows all columns (Part Name, Part #, Vendor, Qty, Unit Price,
+  Total, Status, Notes), includes a grand total footer row, links part names to their URLs,
+  and uses `@media print` CSS for clean output. File written to `/tmp/bom_<project>.html`.
+
 ## [1.1.2] - 2026-05-29
 
 ### Fixed
