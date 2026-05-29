@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -19,7 +21,7 @@
 #include <sstream>
 #include <iomanip>
 
-static const char* APP_VERSION = "1.1.1";
+static const char* APP_VERSION = "1.1.2";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
@@ -340,6 +342,13 @@ struct Project {
 static sqlite3*    g_db = nullptr;
 static std::string g_db_path;
 static std::string g_status_msg;
+static double      g_status_time = 0.0;  // glfwGetTime() when message was set
+
+// Safely convert sqlite3_column_text (which can return NULL) to std::string
+static std::string col_str(sqlite3_stmt* s, int col){
+    const unsigned char* p = sqlite3_column_text(s, col);
+    return p ? reinterpret_cast<const char*>(p) : "";
+}
 
 // Execute a single SQL statement, log errors to status bar
 static void db_exec_one(const char* sql){
@@ -347,6 +356,7 @@ static void db_exec_one(const char* sql){
     sqlite3_exec(g_db, sql, nullptr, nullptr, &err);
     if(err){
         g_status_msg = std::string("DB error: ") + err;
+        g_status_time = glfwGetTime();
         sqlite3_free(err);
     }
 }
@@ -359,12 +369,14 @@ static void db_init(){
     g_db_path = dir + "/bom.db";
     if(sqlite3_open(g_db_path.c_str(), &g_db) != SQLITE_OK){
         g_status_msg = std::string("Cannot open DB: ") + sqlite3_errmsg(g_db);
+        g_status_time = glfwGetTime();
         return;
     }
     // Set pragmas separately — sqlite3_exec handles multi-statement but PRAGMA
     // must be applied to this connection before any schema work.
     db_exec_one("PRAGMA foreign_keys = ON;");
     db_exec_one("PRAGMA journal_mode = WAL;");
+    db_exec_one("PRAGMA synchronous = NORMAL;");
     db_exec_one(R"(
         CREATE TABLE IF NOT EXISTS projects (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -399,8 +411,8 @@ static void db_load(){
     while(sqlite3_step(stmt) == SQLITE_ROW){
         Project p;
         p.id          = sqlite3_column_int(stmt, 0);
-        p.name        = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        p.description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        p.name        = col_str(stmt, 1);
+        p.description = col_str(stmt, 2);
         g_projects.push_back(std::move(p));
     }
     sqlite3_finalize(stmt);
@@ -413,11 +425,11 @@ static void db_load(){
         Part pt;
         pt.id          = sqlite3_column_int(stmt, 0);
         pt.project_id  = sqlite3_column_int(stmt, 1);
-        pt.name        = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        pt.url         = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        pt.part_number = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        pt.vendor      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        pt.notes       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        pt.name        = col_str(stmt, 2);
+        pt.url         = col_str(stmt, 3);
+        pt.part_number = col_str(stmt, 4);
+        pt.vendor      = col_str(stmt, 5);
+        pt.notes       = col_str(stmt, 6);
         pt.quantity    = sqlite3_column_int(stmt, 7);
         pt.unit_price  = sqlite3_column_double(stmt, 8);
         pt.status      = static_cast<PartStatus>(sqlite3_column_int(stmt, 9));
@@ -505,8 +517,15 @@ static void db_delete_part(int id){
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 static void open_url(const std::string& url){
     if(url.empty()) return;
-    std::string cmd = "xdg-open \"" + url + "\" &";
-    system(cmd.c_str());
+    // Use fork+execvp to avoid shell injection via system()
+    pid_t pid = fork();
+    if(pid == 0){
+        // Child: exec xdg-open, detach from parent
+        setsid();
+        execl("/usr/bin/xdg-open", "xdg-open", url.c_str(), nullptr);
+        _exit(1);  // exec failed
+    }
+    // Parent: don't wait — fire and forget
 }
 
 static std::string format_price(double p, bool zero_as_dash = true){
@@ -523,11 +542,19 @@ static double project_total(const Project& p){
 }
 
 // ─── UI State ────────────────────────────────────────────────────────────────
-static int  g_sel_project  = -1;
+static int  g_sel_project    = -1;
+static int  g_sel_project_id  = -1;  // survives db_load() reorder
 static int  g_sel_part     = -1;
 static int  g_sel_part_id  = -1;  // survives db_load() reorder
 
 static void resolve_sel_part(){
+    // Re-resolve selected project by ID first
+    if(g_sel_project_id >= 0){
+        g_sel_project = -1;
+        for(int i = 0; i < static_cast<int>(g_projects.size()); i++)
+            if(g_projects[i].id == g_sel_project_id){ g_sel_project = i; break; }
+    }
+    // Then re-resolve selected part
     g_sel_part = -1;
     if(g_sel_part_id < 0 || g_sel_project < 0 ||
        g_sel_project >= static_cast<int>(g_projects.size())) return;
@@ -612,15 +639,17 @@ static void draw_project_list(){
         std::string label = proj.name + " (" +
             std::to_string(proj.parts.size()) + ")##proj" + std::to_string(i);
         if(ImGui::Selectable(label.c_str(), selected)){
-            g_sel_project = i;
-            g_sel_part    = -1;
-            g_sel_part_id = -1;
+            g_sel_project    = i;
+            g_sel_project_id = proj.id;
+            g_sel_part       = -1;
+            g_sel_part_id    = -1;
         }
         if(selected) ImGui::PopStyleColor(2);
 
         // Context menu (right-click)
         if(ImGui::BeginPopupContextItem(("##ctx_proj" + std::to_string(i)).c_str())){
-            g_sel_project = i;
+            g_sel_project    = i;
+            g_sel_project_id = proj.id;
             if(ImGui::MenuItem("Edit Project")){
                 strncpy(g_proj_name, proj.name.c_str(), sizeof(g_proj_name)-1);
                 strncpy(g_proj_desc, proj.description.c_str(), sizeof(g_proj_desc)-1);
@@ -663,20 +692,20 @@ static void draw_parts_panel(){
         ImGui::PopStyleColor();
     }
     {
-        double total = project_total(proj);
-        // Count installed vs total for a quick progress hint
+        // Show part count + installed progress; cost lives exclusively in the footer
         int installed = 0;
         for(auto& pt : proj.parts)
             if(pt.status == STATUS_INSTALLED) installed++;
-        std::string cost_str = "Total: " + format_price(total, false) +
-                               "   Parts: " + std::to_string(proj.parts.size());
-        if(!proj.parts.empty())
-            cost_str += "   (" + std::to_string(installed) + "/" +
-                        std::to_string(proj.parts.size()) + " installed)";
-        float rw = ImGui::CalcTextSize(cost_str.c_str()).x;
+        int total_parts = static_cast<int>(proj.parts.size());
+        std::string count_str = std::to_string(total_parts) +
+                                (total_parts != 1 ? " parts" : " part");
+        if(total_parts > 0)
+            count_str += "   (" + std::to_string(installed) + "/" +
+                         std::to_string(total_parts) + " installed)";
+        float rw = ImGui::CalcTextSize(count_str.c_str()).x;
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - rw + ImGui::GetCursorPosX() - 8);
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_GREEN);
-        ImGui::TextUnformatted(cost_str.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextUnformatted(count_str.c_str());
         ImGui::PopStyleColor();
     }
     ImGui::Separator();
@@ -732,7 +761,7 @@ static void draw_parts_panel(){
     float avail    = ImGui::GetContentRegionAvail().x;
     ImGui::SameLine(ImGui::GetCursorPosX() + avail - search_w - 8);
     ImGui::SetNextItemWidth(search_w);
-    ImGui::InputTextWithHint("##search", "\xf0\x9f\x94\x8d  Search parts…", g_search, sizeof(g_search));
+    ImGui::InputTextWithHint("##search", "Search parts...", g_search, sizeof(g_search));
     ImGui::Spacing();
 
     // ── Parts table ──
@@ -747,27 +776,31 @@ static void draw_parts_panel(){
 
     std::vector<int> order(proj.parts.size());
     for(int i = 0; i < static_cast<int>(order.size()); i++) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b){
-        const Part& pa = proj.parts[a];
-        const Part& pb = proj.parts[b];
-        int cmp = 0;
-        switch(s_sort_col){
-            case 0: cmp = pa.name.compare(pb.name); break;
-            case 1: cmp = pa.part_number.compare(pb.part_number); break;
-            case 2: cmp = pa.vendor.compare(pb.vendor); break;
-            case 3: cmp = pa.quantity - pb.quantity; break;
-            case 4: cmp = (pa.unit_price < pb.unit_price) ? -1 :
-                           (pa.unit_price > pb.unit_price) ?  1 : 0; break;
-            case 5: { double ta = pa.unit_price*pa.quantity,
-                             tb = pb.unit_price*pb.quantity;
-                      cmp = (ta < tb) ? -1 : (ta > tb) ? 1 : 0; break; }
-            case 6: cmp = static_cast<int>(pa.status) -
-                           static_cast<int>(pb.status); break;
-            case 7: cmp = pa.notes.compare(pb.notes); break;
-            default: break;
-        }
-        return s_sort_asc ? cmp < 0 : cmp > 0;
-    });
+    // Initial sort applied here; re-sorted below when SpecsDirty fires
+    auto do_sort = [&](){
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b){
+            const Part& pa = proj.parts[a];
+            const Part& pb = proj.parts[b];
+            int cmp = 0;
+            switch(s_sort_col){
+                case 0: cmp = pa.name.compare(pb.name); break;
+                case 1: cmp = pa.part_number.compare(pb.part_number); break;
+                case 2: cmp = pa.vendor.compare(pb.vendor); break;
+                case 3: cmp = pa.quantity - pb.quantity; break;
+                case 4: cmp = (pa.unit_price < pb.unit_price) ? -1 :
+                               (pa.unit_price > pb.unit_price) ?  1 : 0; break;
+                case 5: { double ta = pa.unit_price*pa.quantity,
+                                 tb = pb.unit_price*pb.quantity;
+                          cmp = (ta < tb) ? -1 : (ta > tb) ? 1 : 0; break; }
+                case 6: cmp = static_cast<int>(pa.status) -
+                               static_cast<int>(pb.status); break;
+                case 7: cmp = pa.notes.compare(pb.notes); break;
+                default: break;
+            }
+            return s_sort_asc ? cmp < 0 : cmp > 0;
+        });
+    };
+    do_sort();
 
     // Build lowercase search needle once per frame
     std::string needle(g_search);
@@ -794,28 +827,7 @@ static void draw_parts_panel(){
                 s_sort_col = ss->Specs[0].ColumnIndex;
                 s_sort_asc = (ss->Specs[0].SortDirection == ImGuiSortDirection_Ascending);
                 ss->SpecsDirty = false;
-                // Re-sort on spec change
-                std::stable_sort(order.begin(), order.end(), [&](int a, int b){
-                    const Part& pa = proj.parts[a];
-                    const Part& pb = proj.parts[b];
-                    int cmp = 0;
-                    switch(s_sort_col){
-                        case 0: cmp = pa.name.compare(pb.name); break;
-                        case 1: cmp = pa.part_number.compare(pb.part_number); break;
-                        case 2: cmp = pa.vendor.compare(pb.vendor); break;
-                        case 3: cmp = pa.quantity - pb.quantity; break;
-                        case 4: cmp = (pa.unit_price < pb.unit_price) ? -1 :
-                                       (pa.unit_price > pb.unit_price) ?  1 : 0; break;
-                        case 5: { double ta = pa.unit_price*pa.quantity,
-                                         tb = pb.unit_price*pb.quantity;
-                                  cmp = (ta < tb) ? -1 : (ta > tb) ? 1 : 0; break; }
-                        case 6: cmp = static_cast<int>(pa.status) -
-                                       static_cast<int>(pb.status); break;
-                        case 7: cmp = pa.notes.compare(pb.notes); break;
-                        default: break;
-                    }
-                    return s_sort_asc ? cmp < 0 : cmp > 0;
-                });
+                do_sort();
             }
         }
 
@@ -1046,7 +1058,7 @@ static void draw_modals(){
             int new_id = db_insert_project(g_proj_name, g_proj_desc);
             db_load(); resolve_sel_part();
             for(int i = 0; i < static_cast<int>(g_projects.size()); i++)
-                if(g_projects[i].id == new_id){ g_sel_project = i; break; }
+                if(g_projects[i].id == new_id){ g_sel_project = i; g_sel_project_id = new_id; break; }
             ImGui::CloseCurrentPopup();
         }
         pop_accent_style();
@@ -1097,7 +1109,7 @@ static void draw_modals(){
         push_danger_style();
         if(ImGui::Button("Delete", {120,0}) && g_sel_project >= 0){
             db_delete_project(g_projects[g_sel_project].id);
-            g_sel_project = -1; g_sel_part = -1; g_sel_part_id = -1;
+            g_sel_project = -1; g_sel_project_id = -1; g_sel_part = -1; g_sel_part_id = -1;
             db_load(); resolve_sel_part();
             ImGui::CloseCurrentPopup();
         }
@@ -1417,11 +1429,17 @@ int main(){
 
             // Status bar message (right-aligned)
             if(!g_status_msg.empty()){
-                float sw = ImGui::CalcTextSize(g_status_msg.c_str()).x + 8;
-                ImGui::SameLine(ImGui::GetContentRegionAvail().x - sw + ImGui::GetCursorPosX());
-                ImGui::PushStyleColor(ImGuiCol_Text, COL_RED);
-                ImGui::TextUnformatted(g_status_msg.c_str());
-                ImGui::PopStyleColor();
+                double age = glfwGetTime() - g_status_time;
+                if(age > 8.0){
+                    g_status_msg.clear();
+                } else {
+                    float alpha = (age > 5.0) ? static_cast<float>(1.0 - (age - 5.0) / 3.0) : 1.0f;
+                    float sw = ImGui::CalcTextSize(g_status_msg.c_str()).x + 8;
+                    ImGui::SameLine(ImGui::GetContentRegionAvail().x - sw + ImGui::GetCursorPosX());
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(COL_RED.x, COL_RED.y, COL_RED.z, alpha));
+                    ImGui::TextUnformatted(g_status_msg.c_str());
+                    ImGui::PopStyleColor();
+                }
             }
             ImGui::EndMenuBar();
         }

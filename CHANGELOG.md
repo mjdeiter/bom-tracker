@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.2] - 2026-05-29
+
+### Fixed
+- **No emoji in search hint** — removed 🔍 glyph from search placeholder; ImGui font atlas does not cover emoji codepoints, causing startup font errors
+- **Shell injection in open_url** — replaced `system()` call with `fork()`+`execl()` to prevent malicious URLs from executing shell code
+- **NULL crash in db_load** — `sqlite3_column_text` can return NULL for empty columns; added `col_str()` helper with null guard throughout
+- **Status bar never clears** — DB error messages now fade out over 3 s and clear after 8 s
+- **Double sort per frame** — sort lambda extracted to `do_sort()` and called once; the redundant duplicate inside `SpecsDirty` replaced with the shared call
+- **Selected project lost after db_load** — added `g_sel_project_id` mirroring the pattern used for parts; selection survives reloads and reorders
+
+### Changed
+- Header bar no longer duplicates the subtotal — shows part count and installed progress only; cost is shown exclusively in the footer
+- Added `PRAGMA synchronous = NORMAL` for faster writes under WAL mode
+
 ## [1.1.1] - 2026-05-29
 
 ### Added
