@@ -19,7 +19,7 @@
 #include <sstream>
 #include <iomanip>
 
-static const char* APP_VERSION = "1.1.0";
+static const char* APP_VERSION = "1.1.1";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
