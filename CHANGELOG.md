@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.1] - 2026-05-29
+
+### Added
+- **Running subtotal footer** — bottom of the parts panel shows a live subtotal (excl. tax & shipping) in accent gold
+- Footer is filter-aware: subtotal only counts rows matching the current search filter
+- Left side shows part count; updates to "X / Y parts shown" when a search is active
+
+### Fixed
+- Sort/filter state hoisted above `BeginTable` so footer and table rows always walk the same ordered, filtered view
+
 ## [1.1.0] - 2026-05-29
 
 ### Fixed
