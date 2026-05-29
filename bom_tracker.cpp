@@ -741,10 +741,42 @@ static void draw_parts_panel(){
         ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
         ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingStretchProp;
 
+    // Sorting state — hoisted so footer can use same order/needle
+    static int  s_sort_col = 0;
+    static bool s_sort_asc = true;
+
+    std::vector<int> order(proj.parts.size());
+    for(int i = 0; i < static_cast<int>(order.size()); i++) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b){
+        const Part& pa = proj.parts[a];
+        const Part& pb = proj.parts[b];
+        int cmp = 0;
+        switch(s_sort_col){
+            case 0: cmp = pa.name.compare(pb.name); break;
+            case 1: cmp = pa.part_number.compare(pb.part_number); break;
+            case 2: cmp = pa.vendor.compare(pb.vendor); break;
+            case 3: cmp = pa.quantity - pb.quantity; break;
+            case 4: cmp = (pa.unit_price < pb.unit_price) ? -1 :
+                           (pa.unit_price > pb.unit_price) ?  1 : 0; break;
+            case 5: { double ta = pa.unit_price*pa.quantity,
+                             tb = pb.unit_price*pb.quantity;
+                      cmp = (ta < tb) ? -1 : (ta > tb) ? 1 : 0; break; }
+            case 6: cmp = static_cast<int>(pa.status) -
+                           static_cast<int>(pb.status); break;
+            case 7: cmp = pa.notes.compare(pb.notes); break;
+            default: break;
+        }
+        return s_sort_asc ? cmp < 0 : cmp > 0;
+    });
+
+    // Build lowercase search needle once per frame
+    std::string needle(g_search);
+    std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+
     ImGui::PushStyleColor(ImGuiCol_TableHeaderBg,    COL_HEADER_BG);
     ImGui::PushStyleColor(ImGuiCol_TableBorderLight, COL_BORDER);
 
-    float table_h = ImGui::GetContentRegionAvail().y - 6;
+    float table_h = ImGui::GetContentRegionAvail().y - 42;
     if(ImGui::BeginTable("##parts", 8, tflags, {0, table_h})){
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Part Name",  ImGuiTableColumnFlags_DefaultSort, 160);
@@ -757,43 +789,35 @@ static void draw_parts_panel(){
         ImGui::TableSetupColumn("Notes",      0, 150);
         ImGui::TableHeadersRow();
 
-        // Sorting
-        static int  s_sort_col = 0;
-        static bool s_sort_asc = true;
         if(ImGuiTableSortSpecs* ss = ImGui::TableGetSortSpecs()){
             if(ss->SpecsDirty && ss->SpecsCount > 0){
                 s_sort_col = ss->Specs[0].ColumnIndex;
                 s_sort_asc = (ss->Specs[0].SortDirection == ImGuiSortDirection_Ascending);
                 ss->SpecsDirty = false;
+                // Re-sort on spec change
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b){
+                    const Part& pa = proj.parts[a];
+                    const Part& pb = proj.parts[b];
+                    int cmp = 0;
+                    switch(s_sort_col){
+                        case 0: cmp = pa.name.compare(pb.name); break;
+                        case 1: cmp = pa.part_number.compare(pb.part_number); break;
+                        case 2: cmp = pa.vendor.compare(pb.vendor); break;
+                        case 3: cmp = pa.quantity - pb.quantity; break;
+                        case 4: cmp = (pa.unit_price < pb.unit_price) ? -1 :
+                                       (pa.unit_price > pb.unit_price) ?  1 : 0; break;
+                        case 5: { double ta = pa.unit_price*pa.quantity,
+                                         tb = pb.unit_price*pb.quantity;
+                                  cmp = (ta < tb) ? -1 : (ta > tb) ? 1 : 0; break; }
+                        case 6: cmp = static_cast<int>(pa.status) -
+                                       static_cast<int>(pb.status); break;
+                        case 7: cmp = pa.notes.compare(pb.notes); break;
+                        default: break;
+                    }
+                    return s_sort_asc ? cmp < 0 : cmp > 0;
+                });
             }
         }
-        std::vector<int> order(proj.parts.size());
-        for(int i = 0; i < static_cast<int>(order.size()); i++) order[i] = i;
-        std::stable_sort(order.begin(), order.end(), [&](int a, int b){
-            const Part& pa = proj.parts[a];
-            const Part& pb = proj.parts[b];
-            int cmp = 0;
-            switch(s_sort_col){
-                case 0: cmp = pa.name.compare(pb.name); break;
-                case 1: cmp = pa.part_number.compare(pb.part_number); break;
-                case 2: cmp = pa.vendor.compare(pb.vendor); break;
-                case 3: cmp = pa.quantity - pb.quantity; break;
-                case 4: cmp = (pa.unit_price < pb.unit_price) ? -1 :
-                               (pa.unit_price > pb.unit_price) ?  1 : 0; break;
-                case 5: { double ta = pa.unit_price*pa.quantity,
-                                 tb = pb.unit_price*pb.quantity;
-                          cmp = (ta < tb) ? -1 : (ta > tb) ? 1 : 0; break; }
-                case 6: cmp = static_cast<int>(pa.status) -
-                               static_cast<int>(pb.status); break;
-                case 7: cmp = pa.notes.compare(pb.notes); break;
-                default: break;
-            }
-            return s_sort_asc ? cmp < 0 : cmp > 0;
-        });
-
-        // Build lowercase search needle once per frame
-        std::string needle(g_search);
-        std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
 
         for(int oi = 0; oi < static_cast<int>(order.size()); oi++){
             int i    = order[oi];
@@ -879,6 +903,57 @@ static void draw_parts_panel(){
         ImGui::EndTable();
     }
     ImGui::PopStyleColor(2);
+
+    // ── Running total footer ──
+    {
+        // Compute totals for visible (filtered) rows only
+        double vis_subtotal = 0.0;
+        int    vis_count    = 0;
+        int    vis_needed   = 0;
+        for(int oi = 0; oi < static_cast<int>(order.size()); oi++){
+            const Part& pt = proj.parts[order[oi]];
+            if(!needle.empty()){
+                std::string hay = pt.name + " " + pt.part_number + " " +
+                                  pt.vendor + " " + pt.notes + " " + pt.url;
+                std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+                if(hay.find(needle) == std::string::npos) continue;
+            }
+            vis_subtotal += pt.unit_price * pt.quantity;
+            vis_count++;
+            if(pt.status != STATUS_INSTALLED) vis_needed++;
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(COL_PANEL.x, COL_PANEL.y, COL_PANEL.z, 1.0f));
+        ImGui::BeginChild("##footer", {0, 30}, false);
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Left: part count
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        if(needle.empty())
+            ImGui::Text("%d part%s", vis_count, vis_count != 1 ? "s" : "");
+        else
+            ImGui::Text("%d / %d part%s shown", vis_count,
+                static_cast<int>(proj.parts.size()),
+                static_cast<int>(proj.parts.size()) != 1 ? "s" : "");
+        ImGui::PopStyleColor();
+
+        // Right: subtotal label + value
+        std::string sub_str = format_price(vis_subtotal, false);
+        std::string label   = "Subtotal (excl. tax & shipping):  ";
+        float right_w = ImGui::CalcTextSize((label + sub_str).c_str()).x + 16;
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - right_w + ImGui::GetCursorPosX());
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextUnformatted(label.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+        ImGui::TextUnformatted(sub_str.c_str());
+        ImGui::PopStyleColor();
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
 }
 
 // ─── Part form (shared by Add/Edit modals) ───────────────────────────────────
