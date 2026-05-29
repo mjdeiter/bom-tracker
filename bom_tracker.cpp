@@ -227,6 +227,14 @@ static std::string format_price(double p){
 
 static int    g_sel_project      = -1;
 static int    g_sel_part         = -1;
+static int    g_sel_part_id      = -1;  // tracks selection across db_load()
+static void resolve_sel_part(){
+    g_sel_part = -1;
+    if(g_sel_part_id < 0 || g_sel_project < 0 || g_sel_project >= (int)g_projects.size()) return;
+    auto& parts = g_projects[g_sel_project].parts;
+    for(int i=0;i<(int)parts.size();i++)
+        if(parts[i].id == g_sel_part_id){ g_sel_part = i; return; }
+}
 static char   g_proj_name[256]   = {};
 static char   g_proj_desc[512]   = {};
 static char   g_part_name[256]   = {};
@@ -264,7 +272,7 @@ static bool begin_modal(const char* id, ImVec2 size={420,0}){
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, {0.5f,0.5f});
     ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
-    return ImGui::BeginPopupModal(id, nullptr, ImGuiWindowFlags_NoResize);
+    return ImGui::BeginPopupModal(id, nullptr, 0);
 }
 
 static double project_total(const Project& p){
@@ -298,6 +306,7 @@ static void draw_project_list(){
         if(ImGui::Selectable(label.c_str(), selected)){
             g_sel_project = i;
             g_sel_part    = -1;
+            g_sel_part_id = -1;
         }
         if(selected){ ImGui::PopStyleColor(2); }
         if(ImGui::BeginPopupContextItem(("##ctx_proj" + std::to_string(i)).c_str())){
@@ -465,7 +474,7 @@ static void draw_parts_panel(){
             if(has_link) ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
             std::string sl = pt.name + "##row" + std::to_string(i);
             if(ImGui::Selectable(sl.c_str(), row_sel, ImGuiSelectableFlags_SpanAllColumns))
-                g_sel_part = (g_sel_part == i) ? -1 : i;
+                g_sel_part = (g_sel_part == i) ? -1 : i; g_sel_part_id = (g_sel_part < 0) ? -1 : proj.parts[i].id;
             if(ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0) && has_link)
                 open_url(pt.url);
             if(has_link){
@@ -551,7 +560,7 @@ static void draw_modals(){
         push_accent_style();
         if(ImGui::Button("Create", {120,0}) && g_proj_name[0]){
             int new_id = db_insert_project(g_proj_name, g_proj_desc);
-            db_load();
+            db_load(); resolve_sel_part();
             for(int i=0;i<(int)g_projects.size();i++)
                 if(g_projects[i].id==new_id){ g_sel_project=i; break; }
             ImGui::CloseCurrentPopup();
@@ -569,7 +578,7 @@ static void draw_modals(){
         push_accent_style();
         if(ImGui::Button("Save", {120,0}) && g_proj_name[0] && g_sel_project >= 0){
             db_update_project(g_projects[g_sel_project].id, g_proj_name, g_proj_desc);
-            db_load(); g_show_edit_project = false; ImGui::CloseCurrentPopup();
+            db_load(); resolve_sel_part(); g_show_edit_project = false; ImGui::CloseCurrentPopup();
         }
         pop_accent_style(); ImGui::SameLine();
         if(ImGui::Button("Cancel", {80,0})){ g_show_edit_project=false; ImGui::CloseCurrentPopup(); }
@@ -579,12 +588,12 @@ static void draw_modals(){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_RED); ImGui::TextUnformatted("DELETE PROJECT"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         if(g_sel_project >= 0 && g_sel_project < (int)g_projects.size())
-            ImGui::Text("Delete \"%s\" and ALL its parts? This cannot be undone.", g_projects[g_sel_project].name.c_str());
+            ImGui::TextWrapped("Delete \"%s\" and ALL its parts? This cannot be undone.", g_projects[g_sel_project].name.c_str());
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
         push_danger_style();
         if(ImGui::Button("Delete", {120,0}) && g_sel_project >= 0){
             db_delete_project(g_projects[g_sel_project].id);
-            g_sel_project = -1; g_sel_part = -1; db_load();
+            g_sel_project = -1; g_sel_part = -1; g_sel_part_id = -1; db_load(); resolve_sel_part();
             g_show_del_project = false; ImGui::CloseCurrentPopup();
         }
         pop_danger_style(); ImGui::SameLine();
@@ -604,7 +613,7 @@ static void draw_modals(){
             pt.part_number = g_part_pn;   pt.vendor      = g_part_vendor;
             pt.notes       = g_part_notes; pt.quantity   = g_part_qty;
             pt.unit_price  = (double)g_part_price; pt.status = (PartStatus)g_part_status;
-            db_insert_part(pt); db_load();
+            db_insert_part(pt); db_load(); resolve_sel_part();
             g_show_add_part = false; ImGui::CloseCurrentPopup();
         }
         pop_accent_style(); ImGui::SameLine();
@@ -622,7 +631,7 @@ static void draw_modals(){
             ex.name=g_part_name; ex.url=g_part_url; ex.part_number=g_part_pn;
             ex.vendor=g_part_vendor; ex.notes=g_part_notes; ex.quantity=g_part_qty;
             ex.unit_price=(double)g_part_price; ex.status=(PartStatus)g_part_status;
-            db_update_part(ex); db_load();
+            db_update_part(ex); db_load(); resolve_sel_part();
             g_show_edit_part = false; ImGui::CloseCurrentPopup();
         }
         pop_accent_style(); ImGui::SameLine();
@@ -638,7 +647,7 @@ static void draw_modals(){
         push_danger_style();
         if(ImGui::Button("Delete",{120,0}) && g_sel_project >= 0 && g_sel_part >= 0){
             db_delete_part(g_projects[g_sel_project].parts[g_sel_part].id);
-            g_sel_part = -1; db_load();
+            g_sel_part = -1; g_sel_part_id = -1; db_load(); resolve_sel_part();
             g_show_del_part = false; ImGui::CloseCurrentPopup();
         }
         pop_danger_style(); ImGui::SameLine();
@@ -708,8 +717,9 @@ static void apply_theme(){
 
 int main(){
     db_init();
-    db_load();
+    db_load(); resolve_sel_part();
     if(!glfwInit()) return 1;
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
