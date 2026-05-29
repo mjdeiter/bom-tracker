@@ -654,14 +654,31 @@ static void draw_modals(){
         if(ImGui::Button("Cancel",{80,0})){ g_show_del_part=false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
-    if(begin_modal("About##dlg", {360,0})){
+    if(begin_modal("About##dlg", {420,0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT); ImGui::TextUnformatted("BOM TRACKER"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         ImGui::Text("Version: %s (%s)", APP_VERSION, BUILD_HASH_STR);
-        ImGui::Text("DB: %s", g_db_path.c_str());
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
-        ImGui::TextWrapped("Bill of Materials tracker -- Dear ImGui + SQLite3.\nDouble-click a part name to open its URL.");
+        ImGui::TextUnformatted("Source / releases:");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        static const char* repo_url = "https://github.com/mjdeiter/bom-tracker";
+        ImGui::TextUnformatted(repo_url);
+        if(ImGui::IsItemHovered()) ImGui::SetTooltip("Click to copy");
+        if(ImGui::IsItemClicked()) ImGui::SetClipboardText(repo_url);
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextUnformatted("Database:");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextUnformatted(g_db_path.c_str());
+        if(ImGui::IsItemHovered()) ImGui::SetTooltip("Click to copy");
+        if(ImGui::IsItemClicked()) ImGui::SetClipboardText(g_db_path.c_str());
+        ImGui::Spacing();
+        ImGui::Separator(); ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextWrapped("Bill of Materials tracker built with Dear ImGui + SQLite3. Changes save automatically. Double-click a part row to open its URL.");
         ImGui::PopStyleColor();
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
         push_accent_style();
@@ -723,7 +740,8 @@ int main(){
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    GLFWwindow* window = glfwCreateWindow(1100, 680, "BOM Tracker", nullptr, nullptr);
+    std::string win_title = std::string("BOM Tracker v") + APP_VERSION;
+    GLFWwindow* window = glfwCreateWindow(1100, 680, win_title.c_str(), nullptr, nullptr);
     if(!window){ glfwTerminate(); return 1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
