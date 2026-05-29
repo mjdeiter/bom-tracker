@@ -560,7 +560,7 @@ static void draw_modals(){
         if(ImGui::Button("Cancel", {80,0})) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
-    if(g_show_edit_project && begin_modal("Edit Project")){
+    if(begin_modal("Edit Project")){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT); ImGui::TextUnformatted("EDIT PROJECT"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         ImGui::TextUnformatted("Name *"); ImGui::SetNextItemWidth(-1); ImGui::InputText("##ename", g_proj_name, sizeof(g_proj_name));
@@ -575,7 +575,7 @@ static void draw_modals(){
         if(ImGui::Button("Cancel", {80,0})){ g_show_edit_project=false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
-    if(g_show_del_project && begin_modal("Delete Project?", {380,0})){
+    if(begin_modal("Delete Project?", {380,0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_RED); ImGui::TextUnformatted("DELETE PROJECT"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         if(g_sel_project >= 0 && g_sel_project < (int)g_projects.size())
@@ -591,7 +591,7 @@ static void draw_modals(){
         if(ImGui::Button("Cancel",{80,0})){ g_show_del_project=false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
-    if(g_show_add_part && begin_modal("Add Part", {460,0})){
+    if(begin_modal("Add Part", {460,0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT); ImGui::TextUnformatted("ADD PART"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         draw_part_form();
@@ -611,7 +611,7 @@ static void draw_modals(){
         if(ImGui::Button("Cancel",{80,0})){ g_show_add_part=false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
-    if(g_show_edit_part && begin_modal("Edit Part", {460,0})){
+    if(begin_modal("Edit Part", {460,0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT); ImGui::TextUnformatted("EDIT PART"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         draw_part_form();
@@ -629,7 +629,7 @@ static void draw_modals(){
         if(ImGui::Button("Cancel",{80,0})){ g_show_edit_part=false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
-    if(g_show_del_part && begin_modal("Delete Part?", {380,0})){
+    if(begin_modal("Delete Part?", {380,0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_RED); ImGui::TextUnformatted("DELETE PART"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         if(g_sel_project >= 0 && g_sel_part >= 0 && g_sel_part < (int)g_projects[g_sel_project].parts.size())
@@ -645,7 +645,7 @@ static void draw_modals(){
         if(ImGui::Button("Cancel",{80,0})){ g_show_del_part=false; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
-    if(g_show_about && begin_modal("About##dlg", {360,0})){
+    if(begin_modal("About##dlg", {360,0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT); ImGui::TextUnformatted("BOM TRACKER"); ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         ImGui::Text("Version: %s (%s)", APP_VERSION, BUILD_HASH_STR);
@@ -765,12 +765,12 @@ int main(){
                     auto& p=g_projects[g_sel_project];
                     strncpy(g_proj_name,p.name.c_str(),sizeof(g_proj_name)-1);
                     strncpy(g_proj_desc,p.description.c_str(),sizeof(g_proj_desc)-1);
-                    g_show_edit_project=true; ImGui::OpenPopup("Edit Project");
+                    g_show_edit_project=true;
                 }
                 if(g_sel_project>=0){
                     ImGui::PushStyleColor(ImGuiCol_Text, COL_RED);
                     if(ImGui::MenuItem("Delete Project")){
-                        g_show_del_project=true; ImGui::OpenPopup("Delete Project?");
+                        g_show_del_project=true;
                     }
                     ImGui::PopStyleColor();
                 }
