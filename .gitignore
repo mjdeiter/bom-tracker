@@ -1,0 +1,13 @@
+# Build output
+bom-tracker
+
+# ImGui vendored library
+imgui/
+
+# SQLite DB (stored in ~/.local/share/bom-tracker/)
+*.db
+
+# Editor / OS
+*.o
+*.swp
+.DS_Store
