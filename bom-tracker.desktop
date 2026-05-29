@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=BOM Tracker
+Comment=Bill of Materials tracker for hardware projects
+Exec=/home/matt/.local/bin/bom-tracker
+Icon=utilities-system-monitor
+Terminal=false
+Type=Application
+Categories=Utility;
