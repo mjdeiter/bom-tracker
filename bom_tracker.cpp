@@ -22,7 +22,7 @@
 #include <iomanip>
 #include <fstream>
 
-static const char* APP_VERSION = "1.3.0";
+static const char* APP_VERSION = "1.4.0";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
@@ -973,7 +973,8 @@ static bool g_show_edit_part    = false;
 static bool g_show_del_part     = false;
 static bool g_show_about        = false;
 
-static char g_search[256] = {};
+static char  g_search[256]  = {};
+static float g_sidebar_w    = 220.0f;   // draggable project-panel width
 
 // ─── Style helpers ───────────────────────────────────────────────────────────
 static void push_accent_style(){
@@ -1002,7 +1003,7 @@ static bool begin_modal(const char* id, ImVec2 size={420,0}){
 static void draw_project_list(){
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
         ImVec4(COL_PANEL.x, COL_PANEL.y, COL_PANEL.z, 1.0f));
-    ImGui::BeginChild("##proj_panel", {220, 0}, true);
+    ImGui::BeginChild("##proj_panel", {g_sidebar_w, 0}, true);
 
     ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
     ImGui::TextUnformatted("PROJECTS");
@@ -2017,6 +2018,27 @@ int main(){
         // ── Layout ──
         draw_project_list();
         ImGui::SameLine();
+
+        // Draggable splitter handle
+        {
+            const float SPLITTER_W  = 4.0f;
+            const float SIDEBAR_MIN = 140.0f;
+            const float SIDEBAR_MAX = 480.0f;
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float  h = ImGui::GetContentRegionAvail().y;
+            ImGui::InvisibleButton("##splitter", {SPLITTER_W, h});
+            if(ImGui::IsItemHovered())
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            if(ImGui::IsItemActive())
+                g_sidebar_w = std::clamp(g_sidebar_w + ImGui::GetIO().MouseDelta.x,
+                                      SIDEBAR_MIN, SIDEBAR_MAX);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImU32 col = ImGui::IsItemHovered() || ImGui::IsItemActive()
+                      ? IM_COL32(180,140,80,200) : IM_COL32(80,80,80,120);
+            dl->AddRectFilled(p, {p.x + SPLITTER_W, p.y + h}, col);
+            ImGui::SameLine();
+        }
+
         ImGui::BeginGroup();
         draw_parts_panel();
         ImGui::EndGroup();

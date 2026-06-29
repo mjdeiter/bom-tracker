@@ -9,6 +9,8 @@ Designed for hardware hobbyists, makers, and homelab builders who want a fast, o
 
 - **Markdown Import** — `Project → Import from Markdown...` to auto-populate a project
   from any Markdown BOM file; columns matched by name, `##` headings become section groups
+- **Resizable sidebar** — drag the divider between the Projects panel and parts area to
+  adjust the sidebar width (140 px – 480 px)
 - **Section grouping** — parts are grouped under collapsible `▸ Section` header rows
   matching the `##` structure of the source Markdown
 - **Projects** — organize parts into named projects with an optional description
@@ -82,6 +84,7 @@ DESKTOP
 | Open part URL | Double-click a row, or select + `Open URL` |
 | Print BOM | Select a project, click `Print BOM` |
 | Search | Type in the search box (top-right of parts panel) |
+| Resize sidebar | Drag the divider between the Projects panel and the parts area |
 
 ### Markdown Import Format
 

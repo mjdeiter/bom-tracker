@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.0] - 2026-06-29
+
+### Added
+- **Draggable sidebar** — the Projects panel can now be resized by dragging the
+  divider between it and the parts area. Width is clamped between 140 px and 480 px.
+  The splitter highlights gold on hover (matching the app accent colour) and grey
+  otherwise.
+
 ## [1.3.0] - 2026-06-29
 
 ### Added
