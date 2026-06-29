@@ -1,3 +1,4 @@
+#!/usr/bin/env xdg-open
 [Desktop Entry]
 Name=BOM Tracker
 Comment=Bill of Materials tracker for hardware projects

@@ -11,3 +11,6 @@ imgui/
 *.o
 *.swp
 .DS_Store
+*.inc
+*_patch.py
+.directory
