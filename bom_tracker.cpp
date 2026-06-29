@@ -572,6 +572,25 @@ static std::string strip_md_inline(const std::string& s){
     return trim_str(out);
 }
 
+// Strip common BOM document title prefixes before using as project name
+static std::string strip_bom_prefix(const std::string& s){
+    const char* prefixes[] = {
+        "bill of materials (bom):",
+        "bill of materials:",
+        "bom:",
+        "bom -",
+        "bill of materials -",
+        nullptr
+    };
+    std::string sl = to_lower_str(s);
+    for(int i = 0; prefixes[i]; i++){
+        std::string p(prefixes[i]);
+        if(sl.rfind(p, 0) == 0)
+            return trim_str(s.substr(p.size()));
+    }
+    return s;
+}
+
 // Split "| a | b | c |" → {"a","b","c"}
 static std::vector<std::string> split_md_row(const std::string& line){
     std::vector<std::string> cells;
@@ -656,7 +675,7 @@ static ImportResult parse_bom_markdown(const std::string& path){
     for(; idx < lines.size(); idx++){
         std::string t = trim_str(lines[idx]);
         if(t.rfind("# ", 0)==0 && (t.size()<3 || t[1]!='#')){
-            r.project_name = strip_md_inline(trim_str(t.substr(2)));
+            r.project_name = strip_bom_prefix(strip_md_inline(trim_str(t.substr(2))));
             idx++; break;
         }
     }
