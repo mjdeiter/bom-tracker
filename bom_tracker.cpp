@@ -780,15 +780,24 @@ static ImportResult parse_bom_markdown(const std::string& path){
 
 // Open a native file picker via zenity; returns "" if cancelled / not available
 static std::string pick_file_zenity(){
-    FILE* fp = popen("zenity --file-selection --title='Import BOM from Markdown' "
-                     "--file-filter='Markdown | *.md *.markdown' 2>/dev/null", "r");
-    if(!fp) return "";
-    char buf[1024]={};
-    fgets(buf, sizeof(buf), fp);
-    pclose(fp);
-    std::string s(buf);
-    if(!s.empty() && s.back()=='\n') s.pop_back();
-    return s;
+    // Try kdialog (KDE/Plasma) first, then zenity (GNOME/GTK)
+    struct { const char* bin; const char* cmd; } tools[] = {
+        { "kdialog", "kdialog --getopenfilename \"$HOME\" \'Markdown Files (*.md *.markdown)\'" },
+        { "zenity",  "zenity --file-selection --title=\'Import BOM from Markdown\' --file-filter=\'Markdown | *.md *.markdown\'" },
+    };
+    for(auto& t : tools){
+        std::string chk = std::string("which ") + t.bin + " >/dev/null 2>&1";
+        if(system(chk.c_str()) != 0) continue;
+        FILE* fp = popen((std::string(t.cmd) + " 2>/dev/null").c_str(), "r");
+        if(!fp) continue;
+        char buf[1024]={};
+        fgets(buf, sizeof(buf), fp);
+        pclose(fp);
+        std::string s(buf);
+        if(!s.empty() && s.back()=='\n') s.pop_back();
+        if(!s.empty()) return s;
+    }
+    return "";
 }
 
 // Import modal UI state
