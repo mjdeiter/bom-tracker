@@ -1151,7 +1151,7 @@ static void draw_parts_panel(){
     static ImGuiTableFlags tflags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
         ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-        ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingStretchProp;
+        ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingFixedFit;
 
     // Sorting state — hoisted so footer can use same order/needle
     static int  s_sort_col = 0;
@@ -1202,7 +1202,7 @@ static void draw_parts_panel(){
         ImGui::TableSetupColumn("Unit Price", 0, 85);
         ImGui::TableSetupColumn("Total",      0, 85);
         ImGui::TableSetupColumn("Status",     0, 85);
-        ImGui::TableSetupColumn("Notes",      0, 150);
+        ImGui::TableSetupColumn("Notes",      ImGuiTableColumnFlags_WidthStretch, 0);
         ImGui::TableHeadersRow();
 
         if(ImGuiTableSortSpecs* ss = ImGui::TableGetSortSpecs()){
