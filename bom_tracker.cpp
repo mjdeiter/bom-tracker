@@ -20,8 +20,9 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
 
-static const char* APP_VERSION = "1.2.0";
+static const char* APP_VERSION = "1.3.0";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
@@ -541,6 +542,260 @@ static double project_total(const Project& p){
     return t;
 }
 
+
+
+// ─── Markdown BOM Import ─────────────────────────────────────────────────────
+
+static std::string trim_str(const std::string& s){
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if(a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static std::string to_lower_str(std::string s){
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s;
+}
+
+// Strip inline markdown markers: **bold**, *italic*, `code`
+static std::string strip_md_inline(const std::string& s){
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while(i < s.size()){
+        char c = s[i];
+        if(c=='*' || c=='_' || c=='`'){
+            while(i < s.size() && (s[i]=='*'||s[i]=='_'||s[i]=='`')) i++;
+        } else { out += c; i++; }
+    }
+    return trim_str(out);
+}
+
+// Split "| a | b | c |" → {"a","b","c"}
+static std::vector<std::string> split_md_row(const std::string& line){
+    std::vector<std::string> cells;
+    std::stringstream ss(line);
+    std::string cell;
+    bool first = true;
+    while(std::getline(ss, cell, '|')){
+        if(first){ first = false; continue; }
+        cells.push_back(trim_str(cell));
+    }
+    if(!cells.empty() && cells.back().empty()) cells.pop_back();
+    return cells;
+}
+
+// True if line is a table separator row (|---|---|)
+static bool is_md_separator(const std::string& line){
+    for(char c : line)
+        if(c!='|' && c!='-' && c!=' ' && c!=':' && c!='\t') return false;
+    return line.find('-') != std::string::npos;
+}
+
+// True if line is a horizontal rule (---, ***, ___)
+static bool is_md_hr(const std::string& line){
+    std::string t = trim_str(line);
+    if(t.size() < 3) return false;
+    char c = t[0];
+    if(c!='-' && c!='*' && c!='_') return false;
+    for(char ch : t) if(ch!=c && ch!=' ') return false;
+    return true;
+}
+
+static PartStatus parse_status_str(const std::string& s){
+    std::string sl = to_lower_str(trim_str(s));
+    if(sl=="ordered")                                          return STATUS_ORDERED;
+    if(sl=="in stock"||sl=="instock"||sl=="have"||sl=="stock") return STATUS_IN_STOCK;
+    if(sl=="installed"||sl=="done"||sl=="complete")            return STATUS_INSTALLED;
+    return STATUS_NEEDED;
+}
+
+// Parse "1", "2", "1 spool", "As needed", "2–4"
+// Returns integer qty; sets qty_note if value was non-standard
+static int parse_qty_str(const std::string& raw, std::string& qty_note){
+    std::string s = trim_str(raw);
+    if(s.empty()) return 1;
+    try {
+        size_t pos;
+        int q = std::stoi(s, &pos);
+        std::string rem = trim_str(s.substr(pos));
+        if(!rem.empty()) qty_note = s;   // e.g. "1 spool"
+        return std::max(1, q);
+    } catch(...) {}
+    // Non-numeric or range ("As needed", "2–4")
+    qty_note = s;
+    for(size_t j = 0; j < s.size(); j++){
+        if(isdigit((unsigned char)s[j])){
+            try { return std::max(1, std::stoi(s.substr(j))); } catch(...) {}
+        }
+    }
+    return 1;
+}
+
+struct ImportResult {
+    std::string       project_name;
+    std::string       project_desc;
+    std::vector<Part> parts;
+    std::string       error;
+    bool ok() const { return error.empty(); }
+};
+
+static ImportResult parse_bom_markdown(const std::string& path){
+    ImportResult r;
+    std::ifstream mdf(path);
+    if(!mdf){ r.error = "Cannot open: " + path; return r; }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while(std::getline(mdf, line)) lines.push_back(line);
+    mdf.close();
+
+    // --- Find project name: first # heading ---
+    size_t idx = 0;
+    for(; idx < lines.size(); idx++){
+        std::string t = trim_str(lines[idx]);
+        if(t.rfind("# ", 0)==0 && (t.size()<3 || t[1]!='#')){
+            r.project_name = strip_md_inline(trim_str(t.substr(2)));
+            idx++; break;
+        }
+    }
+    if(r.project_name.empty()){ r.error = "No '# Heading' found for project name"; return r; }
+
+    // --- Collect description: text before first table or ## section ---
+    std::string desc_acc;
+    for(size_t j = idx; j < lines.size(); j++){
+        std::string t = trim_str(lines[j]);
+        if(t.empty() || is_md_hr(t)) continue;
+        if(t[0]=='|') break;
+        if(t.rfind("##",0)==0) break;
+        if(t[0]=='>') t = trim_str(t.substr(1));
+        if(!t.empty()){
+            if(!desc_acc.empty()) desc_acc += " ";
+            desc_acc += strip_md_inline(t);
+        }
+    }
+    r.project_desc = desc_acc;
+
+    // --- Scan ALL tables in the file ---
+    enum ColField { CF_NAME, CF_PN, CF_VENDOR, CF_QTY, CF_PRICE, CF_STATUS, CF_NOTES, CF_DESC, CF_URL, CF_COUNT };
+
+    size_t pos = 0;
+    while(pos < lines.size()){
+        // Find next table header row
+        while(pos < lines.size()){
+            std::string t = trim_str(lines[pos]);
+            if(!t.empty() && t[0]=='|') break;
+            pos++;
+        }
+        if(pos >= lines.size()) break;
+
+        // Parse header
+        auto headers = split_md_row(lines[pos]); pos++;
+        if(pos < lines.size() && is_md_separator(lines[pos])) pos++;
+        if(headers.empty()) continue;
+
+        // Map header names → column indices
+        int col_map[CF_COUNT];
+        for(int k = 0; k < CF_COUNT; k++) col_map[k] = -1;
+        for(int hi = 0; hi < (int)headers.size(); hi++){
+            std::string h = to_lower_str(strip_md_inline(headers[hi]));
+            if(h=="part name"||h=="name"||h=="part"||h=="item"||h=="component")
+                { if(col_map[CF_NAME]<0) col_map[CF_NAME]=hi; }
+            else if(h=="part #"||h=="part number"||h=="part no"||h=="pn"||h=="sku"||h=="mpn")
+                col_map[CF_PN]=hi;
+            else if(h=="vendor"||h=="supplier"||h=="source"||h=="store"||h=="retailer")
+                col_map[CF_VENDOR]=hi;
+            else if(h=="qty"||h=="quantity"||h=="count"||h=="amount")
+                col_map[CF_QTY]=hi;
+            else if(h=="unit price"||h=="price"||h=="unit cost"||h=="cost"||h=="each"||h=="unit")
+                col_map[CF_PRICE]=hi;
+            else if(h=="status")
+                col_map[CF_STATUS]=hi;
+            else if(h=="notes"||h=="note"||h=="comments"||h=="comment")
+                col_map[CF_NOTES]=hi;
+            else if(h=="description"||h=="description / specification"||h=="spec"||h=="specification"||h=="details")
+                col_map[CF_DESC]=hi;
+            else if(h=="url"||h=="link"||h=="web"||h=="website"||h=="purchase link"||h=="buy")
+                col_map[CF_URL]=hi;
+        }
+        // Skip tables with no recognizable name column
+        if(col_map[CF_NAME]<0){
+            while(pos < lines.size() && !trim_str(lines[pos]).empty() && trim_str(lines[pos])[0]=='|') pos++;
+            continue;
+        }
+
+        // Parse data rows
+        while(pos < lines.size()){
+            std::string t = trim_str(lines[pos]);
+            if(t.empty() || t[0]!='|') break;
+            auto cells = split_md_row(lines[pos]); pos++;
+
+            auto cell = [&](int field) -> std::string {
+                int i2 = col_map[field];
+                if(i2<0 || i2>=(int)cells.size()) return "";
+                return strip_md_inline(cells[i2]);
+            };
+
+            std::string name = cell(CF_NAME);
+            if(name.empty() || name=="\xe2\x80\x94" || name=="-") continue;
+
+            Part pt;
+            pt.name        = name;
+            pt.part_number = cell(CF_PN);
+            pt.vendor      = cell(CF_VENDOR);
+            pt.url         = cell(CF_URL);
+            pt.status      = (col_map[CF_STATUS]>=0) ? parse_status_str(cell(CF_STATUS)) : STATUS_NEEDED;
+
+            // Merge description column + notes column
+            std::string dv = cell(CF_DESC), nv = cell(CF_NOTES);
+            if(!dv.empty() && !nv.empty()) pt.notes = dv + " \xe2\x80\x94 " + nv;
+            else if(!dv.empty())           pt.notes = dv;
+            else                           pt.notes = nv;
+
+            // Quantity (handle "As needed", "1 spool", "2–4")
+            std::string qty_note;
+            pt.quantity = (col_map[CF_QTY]>=0) ? parse_qty_str(cell(CF_QTY), qty_note) : 1;
+            if(!qty_note.empty()){
+                if(!pt.notes.empty()) pt.notes += " [qty: " + qty_note + "]";
+                else                  pt.notes  = "qty: " + qty_note;
+            }
+
+            // Price (strip $, commas)
+            std::string ps = cell(CF_PRICE);
+            pt.unit_price = 0.0;
+            if(!ps.empty()){
+                std::string pc;
+                for(char c : ps) if(c!='$' && c!=',' && c!=' ') pc+=c;
+                try { pt.unit_price = std::stod(pc); } catch(...) {}
+            }
+
+            r.parts.push_back(std::move(pt));
+        }
+    }
+
+    if(r.parts.empty()){ r.error = "No parts found in any table"; return r; }
+    return r;
+}
+
+// Open a native file picker via zenity; returns "" if cancelled / not available
+static std::string pick_file_zenity(){
+    FILE* fp = popen("zenity --file-selection --title='Import BOM from Markdown' "
+                     "--file-filter='Markdown | *.md *.markdown' 2>/dev/null", "r");
+    if(!fp) return "";
+    char buf[1024]={};
+    fgets(buf, sizeof(buf), fp);
+    pclose(fp);
+    std::string s(buf);
+    if(!s.empty() && s.back()=='\n') s.pop_back();
+    return s;
+}
+
+// Import modal UI state
+static bool         g_show_import_md   = false;
+static char         g_import_path[1024]= {};
+static ImportResult g_import_result;
+static bool         g_import_previewed = false;
 
 // ─── Print / Export ──────────────────────────────────────────────────────
 static void export_bom_html(const Project& proj){
@@ -1126,6 +1381,151 @@ static void draw_part_form(){
     ImGui::InputTextMultiline("##pnotes", g_part_notes, sizeof(g_part_notes), {0, 64});
 }
 
+
+static void draw_import_md_modal(){
+    if(begin_modal("Import from Markdown", {540, 0})){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+        ImGui::TextUnformatted("IMPORT BOM FROM MARKDOWN");
+        ImGui::PopStyleColor();
+        ImGui::Separator(); ImGui::Spacing();
+
+        // File path row
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextUnformatted("File:");
+        ImGui::PopStyleColor();
+        ImGui::SetNextItemWidth(-98);
+        bool changed = ImGui::InputText("##imp_path", g_import_path, sizeof(g_import_path));
+        ImGui::SameLine();
+        push_accent_style();
+        if(ImGui::Button("Browse", {84,0})){
+            std::string picked = pick_file_zenity();
+            if(!picked.empty()){
+                strncpy(g_import_path, picked.c_str(), sizeof(g_import_path)-1);
+                changed = true;
+            }
+        }
+        pop_accent_style();
+        if(changed){ g_import_previewed = false; g_import_result = ImportResult{}; }
+
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextWrapped(
+            "Expects a Markdown file with a # Heading for the project name, then one "
+            "or more tables. Columns matched by name: Part Name / Item, Part #, Vendor, "
+            "Qty, Unit Price, Status, Description, Notes, URL. "
+            "Multiple tables are merged into one project.");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
+        // Preview button
+        bool has_path = g_import_path[0] != '\0';
+        if(!has_path) ImGui::BeginDisabled();
+        push_accent_style();
+        if(ImGui::Button("Preview", {100,0})){
+            g_import_result   = parse_bom_markdown(std::string(g_import_path));
+            g_import_previewed = true;
+        }
+        pop_accent_style();
+        if(!has_path) ImGui::EndDisabled();
+
+        // Results pane
+        if(g_import_previewed){
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+            if(!g_import_result.ok()){
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_RED);
+                ImGui::TextWrapped("Error: %s", g_import_result.error.c_str());
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_GREEN);
+                ImGui::TextUnformatted("Ready to import:");
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+                ImGui::Text("Project : %s", g_import_result.project_name.c_str());
+                if(!g_import_result.project_desc.empty()){
+                    std::string preview_desc = g_import_result.project_desc.substr(0,120);
+                    if(g_import_result.project_desc.size() > 120) preview_desc += "...";
+                    ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+                    ImGui::TextWrapped("Desc    : %s", preview_desc.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::Text("Parts   : %d", (int)g_import_result.parts.size());
+                ImGui::Spacing();
+
+                // Mini preview table
+                ImGui::PushStyleColor(ImGuiCol_TableHeaderBg,    COL_HEADER_BG);
+                ImGui::PushStyleColor(ImGuiCol_TableBorderLight, COL_BORDER);
+                if(ImGui::BeginTable("##imp_prev", 3,
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_SizingStretchProp)){
+                    ImGui::TableSetupColumn("Part Name", 0, 210);
+                    ImGui::TableSetupColumn("Vendor",    0,  90);
+                    ImGui::TableSetupColumn("Qty / $",   0,  80);
+                    ImGui::TableHeadersRow();
+                    int show = std::min((int)g_import_result.parts.size(), 8);
+                    for(int pi = 0; pi < show; pi++){
+                        auto& pt = g_import_result.parts[pi];
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT);
+                        ImGui::TextUnformatted(pt.name.c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+                        ImGui::TextUnformatted(pt.vendor.empty() ? "\xe2\x80\x94" : pt.vendor.c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::TableSetColumnIndex(2);
+                        if(pt.unit_price > 0.0)
+                            ImGui::Text("%d \xc3\x97 %s", pt.quantity, format_price(pt.unit_price, false).c_str());
+                        else
+                            ImGui::Text("qty %d", pt.quantity);
+                    }
+                    if((int)g_import_result.parts.size() > 8){
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+                        ImGui::Text("\xe2\x80\xa6 and %d more", (int)g_import_result.parts.size()-8);
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::PopStyleColor(2);
+            }
+        }
+
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+        bool can_import = g_import_previewed && g_import_result.ok();
+        if(!can_import) ImGui::BeginDisabled();
+        push_accent_style();
+        if(ImGui::Button("Import", {120,0})){
+            int new_id = db_insert_project(g_import_result.project_name, g_import_result.project_desc);
+            for(auto& pt : g_import_result.parts){
+                Part p = pt;
+                p.project_id = new_id;
+                db_insert_part(p);
+            }
+            db_load(); resolve_sel_part();
+            for(int k = 0; k < (int)g_projects.size(); k++)
+                if(g_projects[k].id == new_id){ g_sel_project = k; g_sel_project_id = new_id; break; }
+            g_status_msg  = "Imported \"" + g_import_result.project_name + "\" (" +
+                             std::to_string(g_import_result.parts.size()) + " parts)";
+            g_status_time = glfwGetTime();
+            g_import_result   = ImportResult{};
+            g_import_previewed = false;
+            memset(g_import_path, 0, sizeof(g_import_path));
+            ImGui::CloseCurrentPopup();
+        }
+        pop_accent_style();
+        if(!can_import) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel", {80,0})){
+            g_import_result   = ImportResult{};
+            g_import_previewed = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 // ─── Modals ──────────────────────────────────────────────────────────────────
 static void draw_modals(){
     // All OpenPopup calls must happen OUTSIDE BeginMenuBar so they reach the
@@ -1137,6 +1537,7 @@ static void draw_modals(){
     if(g_show_edit_part)    { ImGui::OpenPopup("Edit Part");       g_show_edit_part    = false; }
     if(g_show_del_part)     { ImGui::OpenPopup("Delete Part?");    g_show_del_part     = false; }
     if(g_show_about)        { ImGui::OpenPopup("About##dlg");      g_show_about        = false; }
+    if(g_show_import_md)    { ImGui::OpenPopup("Import from Markdown"); g_show_import_md = false; }
 
     // ── Add Project ──
     if(begin_modal("Add Project")){
@@ -1508,6 +1909,12 @@ int main(){
                     memset(g_proj_desc, 0, sizeof(g_proj_desc));
                     g_show_add_project = true;
                 }
+                if(ImGui::MenuItem("Import from Markdown...")){
+                    memset(g_import_path, 0, sizeof(g_import_path));
+                    g_import_result   = ImportResult{};
+                    g_import_previewed = false;
+                    g_show_import_md  = true;
+                }
                 ImGui::Separator();
                 if(g_sel_project >= 0 && ImGui::MenuItem("Edit Project")){
                     auto& p = g_projects[g_sel_project];
@@ -1555,6 +1962,7 @@ int main(){
 
         // All modals live outside any child/menu context
         draw_modals();
+        draw_import_md_modal();
 
         ImGui::End();
 
