@@ -330,6 +330,7 @@ struct Part {
     int         quantity    = 1;
     double      unit_price  = 0.0;
     PartStatus  status      = STATUS_NEEDED;
+    std::string section;
 };
 
 struct Project {
@@ -399,6 +400,10 @@ static void db_init(){
             status      INTEGER NOT NULL DEFAULT 0
         );
     )");
+    // Migrate: add section column to existing DBs (no-op if already present)
+    sqlite3_exec(g_db,
+        "ALTER TABLE parts ADD COLUMN section TEXT NOT NULL DEFAULT '';",
+        nullptr, nullptr, nullptr);
 }
 
 static std::vector<Project> g_projects;
@@ -419,8 +424,8 @@ static void db_load(){
     sqlite3_finalize(stmt);
 
     sqlite3_prepare_v2(g_db,
-        "SELECT id,project_id,name,url,part_number,vendor,notes,quantity,unit_price,status "
-        "FROM parts ORDER BY name COLLATE NOCASE",
+        "SELECT id,project_id,name,url,part_number,vendor,notes,quantity,unit_price,status,section "
+        "FROM parts ORDER BY section COLLATE NOCASE, name COLLATE NOCASE",
         -1, &stmt, nullptr);
     while(sqlite3_step(stmt) == SQLITE_ROW){
         Part pt;
@@ -434,6 +439,7 @@ static void db_load(){
         pt.quantity    = sqlite3_column_int(stmt, 7);
         pt.unit_price  = sqlite3_column_double(stmt, 8);
         pt.status      = static_cast<PartStatus>(sqlite3_column_int(stmt, 9));
+        pt.section     = col_str(stmt, 10);
         for(auto& proj : g_projects)
             if(proj.id == pt.project_id){ proj.parts.push_back(std::move(pt)); break; }
     }
@@ -473,8 +479,8 @@ static void db_delete_project(int id){
 static int db_insert_part(const Part& pt){
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(g_db,
-        "INSERT INTO parts(project_id,name,url,part_number,vendor,notes,quantity,unit_price,status)"
-        " VALUES(?,?,?,?,?,?,?,?,?)", -1, &stmt, nullptr);
+        "INSERT INTO parts(project_id,name,url,part_number,vendor,notes,quantity,unit_price,status,section)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?)", -1, &stmt, nullptr);
     sqlite3_bind_int   (stmt, 1, pt.project_id);
     sqlite3_bind_text  (stmt, 2, pt.name.c_str(),        -1, SQLITE_TRANSIENT);
     sqlite3_bind_text  (stmt, 3, pt.url.c_str(),         -1, SQLITE_TRANSIENT);
@@ -484,6 +490,7 @@ static int db_insert_part(const Part& pt){
     sqlite3_bind_int   (stmt, 7, pt.quantity);
     sqlite3_bind_double(stmt, 8, pt.unit_price);
     sqlite3_bind_int   (stmt, 9, static_cast<int>(pt.status));
+    sqlite3_bind_text  (stmt,10, pt.section.c_str(),      -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return static_cast<int>(sqlite3_last_insert_rowid(g_db));
@@ -492,7 +499,7 @@ static int db_insert_part(const Part& pt){
 static void db_update_part(const Part& pt){
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(g_db,
-        "UPDATE parts SET name=?,url=?,part_number=?,vendor=?,notes=?,quantity=?,unit_price=?,status=?"
+        "UPDATE parts SET name=?,url=?,part_number=?,vendor=?,notes=?,quantity=?,unit_price=?,status=?,section=?"
         " WHERE id=?", -1, &stmt, nullptr);
     sqlite3_bind_text  (stmt, 1, pt.name.c_str(),        -1, SQLITE_TRANSIENT);
     sqlite3_bind_text  (stmt, 2, pt.url.c_str(),         -1, SQLITE_TRANSIENT);
@@ -502,7 +509,8 @@ static void db_update_part(const Part& pt){
     sqlite3_bind_int   (stmt, 6, pt.quantity);
     sqlite3_bind_double(stmt, 7, pt.unit_price);
     sqlite3_bind_int   (stmt, 8, static_cast<int>(pt.status));
-    sqlite3_bind_int   (stmt, 9, pt.id);
+    sqlite3_bind_text  (stmt, 9, pt.section.c_str(),      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (stmt,10, pt.id);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -700,11 +708,16 @@ static ImportResult parse_bom_markdown(const std::string& path){
     enum ColField { CF_NAME, CF_PN, CF_VENDOR, CF_QTY, CF_PRICE, CF_STATUS, CF_NOTES, CF_DESC, CF_URL, CF_COUNT };
 
     size_t pos = 0;
+    std::string current_section;
     while(pos < lines.size()){
-        // Find next table header row
+        // Track ## section headings between tables
         while(pos < lines.size()){
             std::string t = trim_str(lines[pos]);
             if(!t.empty() && t[0]=='|') break;
+            if(t.rfind("## ",0)==0)
+                current_section = strip_md_inline(trim_str(t.substr(3)));
+            else if(t.rfind("##",0)==0 && t.size()>2)
+                current_section = strip_md_inline(trim_str(t.substr(2)));
             pos++;
         }
         if(pos >= lines.size()) break;
@@ -719,7 +732,8 @@ static ImportResult parse_bom_markdown(const std::string& path){
         for(int k = 0; k < CF_COUNT; k++) col_map[k] = -1;
         for(int hi = 0; hi < (int)headers.size(); hi++){
             std::string h = to_lower_str(strip_md_inline(headers[hi]));
-            if(h=="part name"||h=="name"||h=="part"||h=="item"||h=="component")
+            if(h=="part name"||h=="name"||h=="part"||h=="item"||h=="component"
+               ||h=="material"||h=="materials")
                 { if(col_map[CF_NAME]<0) col_map[CF_NAME]=hi; }
             else if(h=="part #"||h=="part number"||h=="part no"||h=="pn"||h=="sku"||h=="mpn")
                 col_map[CF_PN]=hi;
@@ -789,6 +803,7 @@ static ImportResult parse_bom_markdown(const std::string& path){
                 try { pt.unit_price = std::stod(pc); } catch(...) {}
             }
 
+            pt.section = current_section;
             r.parts.push_back(std::move(pt));
         }
     }
@@ -1164,6 +1179,9 @@ static void draw_parts_panel(){
         std::stable_sort(order.begin(), order.end(), [&](int a, int b){
             const Part& pa = proj.parts[a];
             const Part& pb = proj.parts[b];
+            // Section is always the primary sort key
+            if(pa.section != pb.section)
+                return pa.section < pb.section;
             int cmp = 0;
             switch(s_sort_col){
                 case 0: cmp = pa.name.compare(pb.name); break;
@@ -1214,9 +1232,24 @@ static void draw_parts_panel(){
             }
         }
 
+        std::string prev_section_label;
         for(int oi = 0; oi < static_cast<int>(order.size()); oi++){
             int i    = order[oi];
             Part& pt = proj.parts[i];
+
+            // Section header row
+            if(!pt.section.empty() && pt.section != prev_section_label){
+                prev_section_label = pt.section;
+                ImGui::TableNextRow();
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                    ImGui::GetColorU32(COL_HEADER_BG));
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+                    ImGui::GetColorU32(COL_HEADER_BG));
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT_DIM);
+                ImGui::TextUnformatted(("  â¸  " + pt.section).c_str());
+                ImGui::PopStyleColor();
+            }
 
             // Filter
             if(!needle.empty()){
