@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.3.0] - 2026-06-29
+
+### Added
+- **Markdown BOM Import** — `Project → Import from Markdown...` parses any Markdown file
+  and creates a project with all parts pre-populated.
+  - First `# Heading` becomes the project name; body text before the first table becomes
+    the description.
+  - Common title prefixes (`Bill of Materials (BOM):`, `BOM:`, etc.) are stripped
+    automatically from the project name.
+  - All tables in the file are scanned and merged into one project.
+  - Columns matched case-insensitively by name: `Part Name` / `Item` / `Component` /
+    `Material`, `Part #` / `SKU`, `Vendor`, `Qty`, `Unit Price`, `Status`,
+    `Description` / `Description / Specification`, `Notes`, `URL`.
+  - Inline Markdown formatting (`**bold**`, `*italic*`, `` `code` ``) stripped from
+    cell values automatically.
+  - Non-integer quantities (`As needed`, `1 spool`, `2–4`) handled gracefully — falls
+    back to qty 1 with the raw value appended to notes.
+  - `Description` and `Notes` columns merged as `spec — note` when both are present.
+  - **Preview step** shows project name, description, and up to 8 parts before
+    committing to the database.
+  - **Browse button** uses `kdialog` (KDE/Plasma) with `zenity` (GNOME/GTK) as fallback.
+- **Section grouping** — `## Headings` in Markdown files are tracked during import and
+  stamped onto each part as its section. Parts table displays dim `▸ Section Name` header
+  rows between groups. Section is the primary sort key; the user-chosen column sort is
+  secondary within each section.
+- **`section` field** added to `Part` and SQLite schema. Existing databases are
+  auto-migrated via `ALTER TABLE parts ADD COLUMN section` on first launch.
+
+### Fixed
+- **Column resize** — switched parts table from `SizingStretchProp` to `SizingFixedFit`
+  so dragging a column border only affects that column; `Notes` column uses
+  `WidthStretch` to fill remaining space.
+- **Browse button** — now correctly finds and uses `kdialog` on KDE/Plasma systems
+  where `zenity` is not installed.
+
 ## [1.2.0] - 2026-05-29
 
 ### Added
