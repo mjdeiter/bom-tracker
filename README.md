@@ -7,8 +7,12 @@ Designed for hardware hobbyists, makers, and homelab builders who want a fast, o
 
 ## Features
 
-- **Markdown Import** — `Project → Import from Markdown...` to auto-populate a project
-  from any Markdown BOM file; columns matched by name, `##` headings become section groups
+- **Markdown Import** — drop a `.md` file on the window, run `bom-tracker file.md`
+  (or `bom-tracker --import file.md` with no window), or use
+  `Project → Import from Markdown...` to create a project from any Markdown BOM;
+  columns matched by name, any other column is kept in the part's notes, `##` headings
+  become section groups, and re-importing a project that already exists syncs it
+  (adds new parts, fills empty fields, never overwrites your edits)
 - **Resizable sidebar** — drag the divider between the Projects panel and parts area to
   adjust the sidebar width (140 px – 480 px)
 - **Section grouping** — parts are grouped under collapsible `▸ Section` header rows

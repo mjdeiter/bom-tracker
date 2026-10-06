@@ -9,6 +9,8 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <unordered_map>
+#include <set>
 #include <filesystem>
 #include <unistd.h>
 #include <sys/types.h>
@@ -22,7 +24,7 @@
 #include <iomanip>
 #include <fstream>
 
-static const char* APP_VERSION = "1.4.0";
+static const char* APP_VERSION = "1.5.0";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
@@ -529,9 +531,13 @@ static void open_url(const std::string& url){
     // Use fork+execvp to avoid shell injection via system()
     pid_t pid = fork();
     if(pid == 0){
-        // Child: exec xdg-open, detach from parent
+        // Child: exec the platform URL opener, detach from parent
         setsid();
+#ifdef __APPLE__
+        execl("/usr/bin/open", "open", url.c_str(), nullptr);
+#else
         execl("/usr/bin/xdg-open", "xdg-open", url.c_str(), nullptr);
+#endif
         _exit(1);  // exec failed
     }
     // Parent: don't wait — fire and forget
@@ -752,10 +758,34 @@ static ImportResult parse_bom_markdown(const std::string& path){
             else if(h=="url"||h=="link"||h=="web"||h=="website"||h=="purchase link"||h=="buy")
                 col_map[CF_URL]=hi;
         }
-        // Skip tables with no recognizable name column
+        auto col_taken = [&](int hi) -> bool {
+            for(int k = 0; k < CF_COUNT; k++) if(col_map[k]==hi) return true;
+            return false;
+        };
+
+        // No recognizable name column: if the table still looks like a parts table
+        // (it has part #, vendor, qty, price or URL columns), use its first free column.
+        if(col_map[CF_NAME]<0){
+            bool bom_like = col_map[CF_PN]>=0 || col_map[CF_VENDOR]>=0 || col_map[CF_QTY]>=0
+                         || col_map[CF_PRICE]>=0 || col_map[CF_URL]>=0;
+            if(bom_like)
+                for(int hi = 0; hi < (int)headers.size(); hi++)
+                    if(!col_taken(hi)){ col_map[CF_NAME] = hi; break; }
+        }
+        // Otherwise it's not a parts table (pinouts, specs, ...): skip it
         if(col_map[CF_NAME]<0){
             while(pos < lines.size() && !trim_str(lines[pos]).empty() && trim_str(lines[pos])[0]=='|') pos++;
             continue;
+        }
+
+        // Columns we don't recognise (Recommendation, Function, Requirement, ...)
+        // are kept as notes instead of being silently dropped.
+        std::vector<int> extra_cols;
+        for(int hi = 0; hi < (int)headers.size(); hi++){
+            if(col_taken(hi)) continue;
+            std::string h = to_lower_str(strip_md_inline(headers[hi]));
+            if(h.empty()||h=="#"||h=="no"||h=="no."||h=="id"||h=="line"||h=="ref") continue;  // row counters
+            extra_cols.push_back(hi);
         }
 
         // Parse data rows
@@ -780,11 +810,24 @@ static ImportResult parse_bom_markdown(const std::string& path){
             pt.url         = cell(CF_URL);
             pt.status      = (col_map[CF_STATUS]>=0) ? parse_status_str(cell(CF_STATUS)) : STATUS_NEEDED;
 
-            // Merge description column + notes column
-            std::string dv = cell(CF_DESC), nv = cell(CF_NOTES);
-            if(!dv.empty() && !nv.empty()) pt.notes = dv + " \xe2\x80\x94 " + nv;
-            else if(!dv.empty())           pt.notes = dv;
-            else                           pt.notes = nv;
+            // Notes = unrecognised columns, then description column, then notes column
+            {
+                std::vector<std::string> pieces;
+                auto add_piece = [&](std::string v){
+                    v = trim_str(v);
+                    std::string lv = to_lower_str(v);
+                    if(v.empty()||v=="\xe2\x80\x94"||v=="\xe2\x80\x93"||v=="-"||lv=="n/a") return;
+                    pieces.push_back(v);
+                };
+                for(int ec : extra_cols)
+                    if(ec < (int)cells.size()) add_piece(strip_md_inline(cells[ec]));
+                add_piece(cell(CF_DESC));
+                add_piece(cell(CF_NOTES));
+                for(size_t pi2 = 0; pi2 < pieces.size(); pi2++){
+                    if(pi2) pt.notes += " \xe2\x80\x94 ";
+                    pt.notes += pieces[pi2];
+                }
+            }
 
             // Quantity (handle "As needed", "1 spool", "2–4")
             std::string qty_note;
@@ -812,8 +855,132 @@ static ImportResult parse_bom_markdown(const std::string& path){
     return r;
 }
 
+// ─── One-shot import ─────────────────────────────────────────────────────────
+// Parse a Markdown BOM and create the project + parts in one step. If a project
+// with the same name already exists it is *synced* instead of duplicated: new
+// parts are added and empty fields (part #, vendor, URL, notes) are filled in,
+// but quantity / price / status and anything you've typed are never overwritten.
+struct ImportOutcome {
+    bool        ok = false;
+    std::string error;
+    std::string project_name;
+    int         project_id = 0;
+    bool        merged = false;
+    int         added = 0, filled = 0, unchanged = 0;
+};
+
+static std::string norm_key(const std::string& s){ return to_lower_str(trim_str(s)); }
+
+static ImportOutcome import_markdown_file(const std::string& path){
+    ImportOutcome o;
+    ImportResult r = parse_bom_markdown(path);
+    if(!r.ok()){ o.error = r.error; return o; }
+    o.project_name = r.project_name;
+
+    db_load();  // make sure we're comparing against what's really in the DB
+    const Project* existing = nullptr;
+    for(auto& p : g_projects)
+        if(norm_key(p.name) == norm_key(r.project_name)){ existing = &p; break; }
+    // Renamed the project since the last import? Fall back to the project that
+    // already holds most of these parts (>= 60% of them, and at least 2).
+    if(!existing){
+        std::set<std::string> incoming;
+        for(auto& pt : r.parts) incoming.insert(norm_key(pt.name));
+        size_t best = 0;
+        for(auto& p : g_projects){
+            std::set<std::string> have;
+            for(auto& ep : p.parts) have.insert(norm_key(ep.name));
+            size_t hits = 0;
+            for(auto& k : incoming) if(have.count(k)) hits++;
+            if(hits > best){ best = hits; existing = &p; }
+        }
+        if(best < 2 || best * 10 < incoming.size() * 6) existing = nullptr;
+    }
+    if(existing) o.project_name = existing->name;
+
+    db_exec_one("BEGIN");
+    if(!existing){
+        o.project_id = db_insert_project(r.project_name, r.project_desc);
+        for(auto& pt : r.parts){
+            Part p = pt; p.project_id = o.project_id;
+            db_insert_part(p); o.added++;
+        }
+    } else {
+        o.merged     = true;
+        o.project_id = existing->id;
+        if(existing->description.empty() && !r.project_desc.empty())
+            db_update_project(existing->id, existing->name, r.project_desc);
+
+        std::unordered_multimap<std::string, const Part*> by_key;
+        for(auto& ep : existing->parts) by_key.emplace(norm_key(ep.name) + "\x1f" + norm_key(ep.section), &ep);
+        std::unordered_multimap<std::string, const Part*> by_name;
+        for(auto& ep : existing->parts) by_name.emplace(norm_key(ep.name), &ep);
+        std::set<int> used;
+
+        for(auto& pt : r.parts){
+            const Part* match = nullptr;
+            auto range = by_key.equal_range(norm_key(pt.name) + "\x1f" + norm_key(pt.section));
+            for(auto it = range.first; it != range.second; ++it)
+                if(!used.count(it->second->id)){ match = it->second; used.insert(match->id); break; }
+            if(!match){   // same part moved to a different section
+                auto r2 = by_name.equal_range(norm_key(pt.name));
+                for(auto it = r2.first; it != r2.second; ++it)
+                    if(!used.count(it->second->id)){ match = it->second; used.insert(match->id); break; }
+            }
+
+            if(!match){
+                Part p = pt; p.project_id = existing->id;
+                db_insert_part(p); o.added++;
+                continue;
+            }
+            Part up = *match; bool changed = false;
+            if(up.part_number.empty() && !pt.part_number.empty()){ up.part_number = pt.part_number; changed = true; }
+            if(up.vendor.empty()      && !pt.vendor.empty())     { up.vendor      = pt.vendor;      changed = true; }
+            if(up.url.empty()         && !pt.url.empty())        { up.url         = pt.url;         changed = true; }
+            if(up.notes.empty()       && !pt.notes.empty())      { up.notes       = pt.notes;       changed = true; }
+            if(changed){ db_update_part(up); o.filled++; } else o.unchanged++;
+        }
+    }
+    db_exec_one("COMMIT");
+    db_load();
+    o.ok = true;
+    return o;
+}
+
+static std::string describe_outcome(const ImportOutcome& o){
+    if(!o.merged)
+        return "Imported \"" + o.project_name + "\" (" + std::to_string(o.added) + " parts)";
+    return "Synced \"" + o.project_name + "\": " + std::to_string(o.added) + " added, " +
+           std::to_string(o.filled) + " filled in, " + std::to_string(o.unchanged) + " unchanged";
+}
+
+// Files dropped onto the window are queued here and handled in the main loop
+static std::vector<std::string> g_dropped_files;
+static void drop_callback(GLFWwindow*, int count, const char** paths){
+    for(int i = 0; i < count; i++) g_dropped_files.push_back(paths[i]);
+}
+
+static bool looks_like_markdown(const std::string& path){
+    std::string l = to_lower_str(path);
+    auto ends = [&](const char* ext){ size_t n = strlen(ext); return l.size()>=n && l.compare(l.size()-n, n, ext)==0; };
+    return ends(".md") || ends(".markdown") || ends(".txt");
+}
+
 // Open a native file picker via zenity; returns "" if cancelled / not available
 static std::string pick_file_zenity(){
+#ifdef __APPLE__
+    // macOS: native picker via osascript
+    {
+        FILE* fp = popen("osascript -e 'POSIX path of (choose file with prompt \"Import BOM from Markdown\")' 2>/dev/null", "r");
+        if(!fp) return "";
+        char buf[1024]={};
+        fgets(buf, sizeof(buf), fp);
+        pclose(fp);
+        std::string s(buf);
+        if(!s.empty() && s.back()=='\n') s.pop_back();
+        return s;
+    }
+#endif
     // Try kdialog (KDE/Plasma) first, then zenity (GNOME/GTK)
     struct { const char* bin; const char* cmd; } tools[] = {
         { "kdialog", "kdialog --getopenfilename \"$HOME\" \'Markdown Files (*.md *.markdown)\'" },
@@ -1444,6 +1611,12 @@ static void draw_part_form(){
 }
 
 
+static void select_project_by_id(int id){
+    resolve_sel_part();
+    for(int k = 0; k < (int)g_projects.size(); k++)
+        if(g_projects[k].id == id){ g_sel_project = k; g_sel_project_id = id; break; }
+}
+
 static void draw_import_md_modal(){
     if(begin_modal("Import from Markdown", {540, 0})){
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
@@ -1473,8 +1646,11 @@ static void draw_import_md_modal(){
         ImGui::TextWrapped(
             "Expects a Markdown file with a # Heading for the project name, then one "
             "or more tables. Columns matched by name: Part Name / Item, Part #, Vendor, "
-            "Qty, Unit Price, Status, Description, Notes, URL. "
-            "Multiple tables are merged into one project.");
+            "Qty, Unit Price, Status, Description, Notes, URL; any other column "
+            "(Recommendation, Function, ...) is kept in the part's notes. "
+            "Multiple tables are merged into one project, and re-importing a project "
+            "that already exists fills in missing details instead of duplicating it. "
+            "Tip: you can also just drop a .md file onto the window.");
         ImGui::PopStyleColor();
         ImGui::Spacing();
 
@@ -1559,17 +1735,9 @@ static void draw_import_md_modal(){
         if(!can_import) ImGui::BeginDisabled();
         push_accent_style();
         if(ImGui::Button("Import", {120,0})){
-            int new_id = db_insert_project(g_import_result.project_name, g_import_result.project_desc);
-            for(auto& pt : g_import_result.parts){
-                Part p = pt;
-                p.project_id = new_id;
-                db_insert_part(p);
-            }
-            db_load(); resolve_sel_part();
-            for(int k = 0; k < (int)g_projects.size(); k++)
-                if(g_projects[k].id == new_id){ g_sel_project = k; g_sel_project_id = new_id; break; }
-            g_status_msg  = "Imported \"" + g_import_result.project_name + "\" (" +
-                             std::to_string(g_import_result.parts.size()) + " parts)";
+            ImportOutcome oc = import_markdown_file(std::string(g_import_path));
+            if(oc.ok) select_project_by_id(oc.project_id);
+            g_status_msg  = oc.ok ? describe_outcome(oc) : "Import failed: " + oc.error;
             g_status_time = glfwGetTime();
             g_import_result   = ImportResult{};
             g_import_previewed = false;
@@ -1880,16 +2048,50 @@ static void apply_theme(){
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
-int main(){
+int main(int argc, char** argv){
+    bool headless = false;
+    std::vector<std::string> cli_files;
+    for(int i = 1; i < argc; i++){
+        std::string a = argv[i];
+        if(a == "--import")                  headless = true;
+        else if(a == "-h" || a == "--help"){
+            printf("BOM Tracker v%s\n"
+                   "Usage: bom-tracker [file.md ...]          open the app, importing any Markdown BOMs first\n"
+                   "       bom-tracker --import file.md ...   import Markdown BOMs without opening a window\n",
+                   APP_VERSION);
+            return 0;
+        }
+        else cli_files.push_back(a);
+    }
+
     db_init();
     db_load();
+
+    // Markdown files given on the command line: create / sync the project(s)
+    std::string pending_status;
+    int last_imported_id = -1, cli_failures = 0;
+    for(auto& f : cli_files){
+        ImportOutcome oc = import_markdown_file(f);
+        if(oc.ok){ last_imported_id = oc.project_id; pending_status = describe_outcome(oc); }
+        else     { cli_failures++; pending_status = "Import failed: " + oc.error; }
+        if(headless) printf("%s: %s\n", f.c_str(), oc.ok ? describe_outcome(oc).c_str() : ("ERROR: " + oc.error).c_str());
+    }
+    if(headless){
+        if(cli_files.empty()){ fprintf(stderr, "bom-tracker --import: no files given\n"); return 2; }
+        return cli_failures ? 1 : 0;
+    }
+
     resolve_sel_part();
+    if(last_imported_id >= 0) select_project_by_id(last_imported_id);
 
     if(!glfwInit()) return 1;
     glfwWindowHint(GLFW_RESIZABLE,              GLFW_TRUE);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,  3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,  3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);  // required for core profile on macOS
+#endif
 
     std::string win_title = std::string("BOM Tracker v") + APP_VERSION;
     GLFWwindow* window = glfwCreateWindow(1160, 700, win_title.c_str(), nullptr, nullptr);
@@ -1920,22 +2122,48 @@ int main(){
             "/usr/share/fonts/TTF/MesloLGSNerdFontMono-Regular.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
             nullptr
         };
         for(int fi = 0; fonts[fi]; fi++){
             if(access(fonts[fi], R_OK) == 0){
+#ifdef __APPLE__
+                // Rasterize at Retina scale, then scale back down for crisp text
+                float xs = 1.0f, ys = 1.0f;
+                glfwGetWindowContentScale(window, &xs, &ys);
+                io.Fonts->AddFontFromFileTTF(fonts[fi], 14.0f * xs);
+                io.FontGlobalScale = 1.0f / xs;
+#else
                 io.Fonts->AddFontFromFileTTF(fonts[fi], 14.0f);
+#endif
                 break;
             }
         }
     }
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+    glfwSetDropCallback(window, drop_callback);
+    if(!pending_status.empty()){ g_status_msg = pending_status; g_status_time = glfwGetTime(); }
     ImGui_ImplOpenGL3_Init("#version 330");
     apply_theme();
 
     while(!glfwWindowShouldClose(window)){
         glfwPollEvents();
+
+        // ── Markdown files dropped onto the window ──
+        if(!g_dropped_files.empty()){
+            std::vector<std::string> dropped; dropped.swap(g_dropped_files);
+            for(auto& f : dropped){
+                if(!looks_like_markdown(f)){
+                    g_status_msg = "Not a Markdown file: " + std::filesystem::path(f).filename().string();
+                } else {
+                    ImportOutcome oc = import_markdown_file(f);
+                    if(oc.ok){ select_project_by_id(oc.project_id); g_status_msg = describe_outcome(oc); }
+                    else       g_status_msg = "Import failed: " + oc.error;
+                }
+                g_status_time = glfwGetTime();
+            }
+        }
 
         // ── Keyboard shortcuts ──
         ImGuiIO& kio = ImGui::GetIO();
