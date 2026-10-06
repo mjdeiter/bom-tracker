@@ -3,6 +3,8 @@
 A lightweight Bill of Materials tracker built with [Dear ImGui](https://github.com/ocornut/imgui) and SQLite3.
 Designed for hardware hobbyists, makers, and homelab builders who want a fast, offline, no-nonsense parts tracker.
 
+Also has a phone-friendly web UI and live sync between machines: see [WEB.md](WEB.md).
+
 ![BOM Tracker](https://raw.githubusercontent.com/mjdeiter/bom-tracker/master/screenshot.png)
 
 ## Features
