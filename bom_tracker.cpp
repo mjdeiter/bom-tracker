@@ -529,9 +529,13 @@ static void open_url(const std::string& url){
     // Use fork+execvp to avoid shell injection via system()
     pid_t pid = fork();
     if(pid == 0){
-        // Child: exec xdg-open, detach from parent
+        // Child: exec the platform URL opener, detach from parent
         setsid();
+#ifdef __APPLE__
+        execl("/usr/bin/open", "open", url.c_str(), nullptr);
+#else
         execl("/usr/bin/xdg-open", "xdg-open", url.c_str(), nullptr);
+#endif
         _exit(1);  // exec failed
     }
     // Parent: don't wait — fire and forget
@@ -814,6 +818,19 @@ static ImportResult parse_bom_markdown(const std::string& path){
 
 // Open a native file picker via zenity; returns "" if cancelled / not available
 static std::string pick_file_zenity(){
+#ifdef __APPLE__
+    // macOS: native picker via osascript
+    {
+        FILE* fp = popen("osascript -e 'POSIX path of (choose file with prompt \"Import BOM from Markdown\")' 2>/dev/null", "r");
+        if(!fp) return "";
+        char buf[1024]={};
+        fgets(buf, sizeof(buf), fp);
+        pclose(fp);
+        std::string s(buf);
+        if(!s.empty() && s.back()=='\n') s.pop_back();
+        return s;
+    }
+#endif
     // Try kdialog (KDE/Plasma) first, then zenity (GNOME/GTK)
     struct { const char* bin; const char* cmd; } tools[] = {
         { "kdialog", "kdialog --getopenfilename \"$HOME\" \'Markdown Files (*.md *.markdown)\'" },
@@ -1890,6 +1907,9 @@ int main(){
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,  3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,  3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);  // required for core profile on macOS
+#endif
 
     std::string win_title = std::string("BOM Tracker v") + APP_VERSION;
     GLFWwindow* window = glfwCreateWindow(1160, 700, win_title.c_str(), nullptr, nullptr);
@@ -1920,11 +1940,20 @@ int main(){
             "/usr/share/fonts/TTF/MesloLGSNerdFontMono-Regular.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
             nullptr
         };
         for(int fi = 0; fonts[fi]; fi++){
             if(access(fonts[fi], R_OK) == 0){
+#ifdef __APPLE__
+                // Rasterize at Retina scale, then scale back down for crisp text
+                float xs = 1.0f, ys = 1.0f;
+                glfwGetWindowContentScale(window, &xs, &ys);
+                io.Fonts->AddFontFromFileTTF(fonts[fi], 14.0f * xs);
+                io.FontGlobalScale = 1.0f / xs;
+#else
                 io.Fonts->AddFontFromFileTTF(fonts[fi], 14.0f);
+#endif
                 break;
             }
         }
