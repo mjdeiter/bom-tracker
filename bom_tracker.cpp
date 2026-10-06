@@ -24,7 +24,7 @@
 #include <iomanip>
 #include <fstream>
 
-static const char* APP_VERSION = "1.5.0";
+static const char* APP_VERSION = "1.6.0";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
@@ -381,6 +381,8 @@ static void db_init(){
     db_exec_one("PRAGMA foreign_keys = ON;");
     db_exec_one("PRAGMA journal_mode = WAL;");
     db_exec_one("PRAGMA synchronous = NORMAL;");
+    // Other writers (web app, sync) share this file; wait briefly instead of failing
+    sqlite3_busy_timeout(g_db, 3000);
     db_exec_one(R"(
         CREATE TABLE IF NOT EXISTS projects (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1118,6 +1120,44 @@ static void resolve_sel_part(){
     auto& parts = g_projects[g_sel_project].parts;
     for(int i = 0; i < static_cast<int>(parts.size()); i++)
         if(parts[i].id == g_sel_part_id){ g_sel_part = i; return; }
+}
+
+// ─── Live refresh ───────────────────────────────────────────────────────────
+// PRAGMA data_version changes only when ANOTHER connection commits (web app, sync
+// agent, a second desktop instance) and never for this app's own writes, so it is a
+// cheap "someone else changed the data" signal. The reload is deferred while any
+// dialog is open so an in-progress edit never has its row moved from under it.
+static int    g_last_data_version = -1;
+static bool   g_external_pending  = false;
+static double g_next_poll_time    = 0.0;
+
+static int db_data_version(){
+    sqlite3_stmt* st = nullptr;
+    int v = -1;
+    if(sqlite3_prepare_v2(g_db, "PRAGMA data_version;", -1, &st, nullptr) == SQLITE_OK
+       && sqlite3_step(st) == SQLITE_ROW)
+        v = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
+static void poll_external_changes(double now){
+    if(now < g_next_poll_time) return;
+    g_next_poll_time = now + 1.0;
+    int v = db_data_version();
+    if(g_last_data_version < 0) g_last_data_version = v;
+    else if(v >= 0 && v != g_last_data_version){
+        g_last_data_version = v;
+        g_external_pending  = true;
+    }
+    if(g_external_pending &&
+       !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)){
+        db_load();
+        resolve_sel_part();
+        g_external_pending = false;
+        g_status_msg  = "Updated from another device";
+        g_status_time = now;
+    }
 }
 
 static char  g_proj_name  [256]  = {};
@@ -2149,6 +2189,7 @@ int main(int argc, char** argv){
 
     while(!glfwWindowShouldClose(window)){
         glfwPollEvents();
+        poll_external_changes(glfwGetTime());
 
         // ── Markdown files dropped onto the window ──
         if(!g_dropped_files.empty()){

@@ -1,6 +1,6 @@
 # BOM Tracker: web UI and sync (`bom_web.py`)
 
-Applies to `bom_web.py` v1.0.0 (its changelog is in the file header).
+Applies to `bom_web.py` v1.1.0 (its changelog is in the file header).
 
 A single stdlib-only Python file that adds a phone-friendly web UI to BOM Tracker and keeps
 `bom.db` in sync across machines. The C++ app is unchanged and keeps working as before.
@@ -13,14 +13,19 @@ A single stdlib-only Python file that adds a phone-friendly web UI to BOM Tracke
 - Rows are matched across machines by uuid. Rows that existed at migration get deterministic
   `legacy-*` ids, so databases that were identical beforehand stay matched.
 - Sync is last-write-wins per row. Deletes propagate as tombstones.
-- The desktop app loads data at startup and after its own edits, so restart it to see changes
-  made elsewhere.
+- Changes show up live everywhere: the phone page polls `/api/version` every 3 s and refreshes
+  itself, and the desktop app (v1.6.0+) watches `PRAGMA data_version` and reloads within about
+  a second of another connection writing (it waits until any open dialog is closed).
+- Other machines run `sync --watch`: it checks the local database and the server every 3 s and
+  syncs only when something changed (plus a full sync every 60 s as a safety net), so an edit on
+  one machine reaches the others in a few seconds.
 
 ## Commands
 
 ```bash
 python3 bom_web.py serve   [--host 100.64.0.2] [--port 8787] [--db PATH]   # web UI + API
-python3 bom_web.py sync    [--server http://100.64.0.2:8787] [--db PATH]   # run on other machines
+python3 bom_web.py sync    [--server http://100.64.0.2:8787] [--db PATH]   # one-shot sync
+python3 bom_web.py sync --watch [--server ...] [--db PATH]                 # stay running, sync on change
 python3 bom_web.py migrate [--db PATH]                                     # schema only
 ```
 
@@ -49,5 +54,6 @@ WantedBy=default.target
 ```
 
 Other machines: fetch the script from the server (`curl http://<private-ip>:8787/bom_web.py`),
-then run `python3 bom_web.py sync --server http://<private-ip>:8787` on a timer
-(cron, or a launchd agent with `StartInterval` 300 on macOS).
+then run `python3 bom_web.py sync --watch --server http://<private-ip>:8787` as a long-running
+service (a launchd agent with `KeepAlive` on macOS, or a systemd user unit on Linux). A one-shot
+`sync` on a timer (cron, or launchd `StartInterval`) also works but is slower to propagate.

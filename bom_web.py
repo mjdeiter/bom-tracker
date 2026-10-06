@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """bom_web.py - BOM Tracker web UI + sync companion (works alongside the C++ app)
-Version: 1.0.0
+Version: 1.1.0
 Changelog:
+  1.1.0 (2026-10-06) Live updates. New /api/version change token; the phone page polls it
+        and refreshes itself; 'sync --watch' keeps a machine in step within seconds
+        (checks every 3 s, pushes/pulls only when something changed, full sync every 60 s).
   1.0.0 (2026-10-06) Initial release. Idempotent schema migration (uuid, updated_at,
         tombstones + triggers, so the unmodified C++ app is tracked), mobile web UI,
         JSON API, and a 'sync' client mode (last-write-wins per row, by uuid).
 Usage:
+  bom_web.py sync  --watch [--server URL] [--db PATH]   # long-running, replaces timer-based sync
   bom_web.py serve [--host 100.64.0.2] [--port 8787] [--db PATH]
   bom_web.py sync  [--server http://100.64.0.2:8787] [--db PATH]
   bom_web.py migrate [--db PATH]
@@ -13,7 +17,7 @@ Usage:
 import argparse, json, os, sqlite3, sys, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEF_DB = os.path.expanduser("~/.local/share/bom-tracker/bom.db")
 NOW = "CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)"
 ms = lambda: int(time.time() * 1000)
@@ -47,6 +51,14 @@ def migrate(c, db):
         create trigger if not exists {t}_ad after delete on {t} when old.uuid is not null begin
           insert or replace into tombstones values(old.uuid,'{kind}',{NOW}); end;""")
     c.commit()
+
+
+def token(c):
+    """Cheap fingerprint of the synced data; changes whenever any row is added, edited or deleted."""
+    r = c.execute("select (select coalesce(max(updated_at),0)||'.'||count(*) from projects),"
+                  "(select coalesce(max(updated_at),0)||'.'||count(*) from parts),"
+                  "(select coalesce(max(deleted_at),0)||'.'||count(*) from tombstones)").fetchone()
+    return "|".join(r)
 
 
 def dump(c, since=0):
@@ -133,6 +145,7 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/data":
                 return self.send({"projects": [dict(r) for r in c.execute("select id,name,description from projects order by name collate nocase")],
                                   "parts": [dict(r) for r in c.execute("select id,project_id,name,url,part_number,vendor,notes,quantity,unit_price,status,section from parts order by section collate nocase,name collate nocase")]})
+            if u.path == "/api/version": return self.send({"token": token(c), "now": ms()})
             if u.path == "/api/sync":
                 return self.send(dump(c, int(urllib.parse.parse_qs(u.query).get("since", ["0"])[0])))
             self.send({"error": "not found"}, 404)
@@ -164,7 +177,7 @@ def post(url, obj):
     return json.load(urllib.request.urlopen(r, timeout=30))
 
 
-def sync(db, server):
+def sync(db, server, quiet=False):
     c = connect(db); migrate(c, db)
     sp = os.path.join(os.path.dirname(db), "bom-sync-state.json")
     st = json.load(open(sp)) if os.path.exists(sp) else {"local": 0, "server": 0}
@@ -173,9 +186,38 @@ def sync(db, server):
     if "error" in back: sys.exit("server error: " + back["error"])
     with c: apply(c, back)
     json.dump({"local": t0 - 2000, "server": back["now"] - 2000}, open(sp, "w"))
-    print("sync ok: sent %d/%d/%d, received %d/%d/%d (projects/parts/deletes)" % (
-        len(out["projects"]), len(out["parts"]), len(out["tombstones"]),
-        len(back["projects"]), len(back["parts"]), len(back["tombstones"])))
+    n = (len(out["projects"]), len(out["parts"]), len(out["tombstones"]),
+         len(back["projects"]), len(back["parts"]), len(back["tombstones"]))
+    if not (quiet and not any(n)):
+        print("%s sync ok: sent %d/%d/%d, received %d/%d/%d (projects/parts/deletes)" % ((time.strftime("%H:%M:%S"),) + n), flush=True)
+
+
+def get(url):
+    return json.load(urllib.request.urlopen(url, timeout=10))
+
+
+def watch(db, server, every=3, full=60):
+    """Stay running: sync when either side's data changes (checked every `every` s), plus a full sync every `full` s."""
+    server = server.rstrip("/")
+    last_l = last_r = None; last_full = 0.0; last_err = None
+    print("watching %s (db %s), checking every %ds" % (server, db, every), flush=True)
+    while True:
+        try:
+            c = connect(db); l = token(c); c.close()
+            r = get(server + "/api/version")["token"]
+            if l != last_l or r != last_r or time.time() - last_full >= full:
+                sync(db, server, quiet=True)
+                c = connect(db); last_l = token(c); c.close()
+                last_r = get(server + "/api/version")["token"]
+                last_full = time.time()
+            if last_err: print(time.strftime("%H:%M:%S"), "recovered", flush=True)
+            last_err = None
+        except (Exception, SystemExit) as e:
+            if str(e) != last_err:
+                print(time.strftime("%H:%M:%S"), "watch error:", e, flush=True)
+            last_err = str(e)
+            last_l = last_r = None
+        time.sleep(every)
 
 
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -223,7 +265,10 @@ async function save(){const b={id:eid,project_id:cur};F.forEach(k=>b[k]=$("f_"+k
 async function del(){if(confirm("Delete this part?")){await api("/api/part/delete",{id:eid});$("dlg").close();load()}}
 async function cyc(id){const x=D.parts.find(p=>p.id==id);x.status=(x.status+1)%4;await api("/api/part",x);load()}
 async function newproj(){const n=prompt("New project name");if(n){const r=await api("/api/project",{name:n});if(r.id)cur=r.id;load()}}
-load();document.addEventListener("visibilitychange",()=>{if(!document.hidden&&!$("dlg").open)load()});
+let tok=null;
+async function poll(){if(document.hidden)return;try{const v=await api("/api/version");if(tok===null)tok=v.token;else if(v.token!==tok&&!$("dlg").open){await load();tok=v.token}}catch(_){}}
+load();poll();setInterval(poll,3000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&!$("dlg").open)load().then(poll)});
 </script></body></html>"""
 
 
@@ -231,11 +276,12 @@ def main():
     ap = argparse.ArgumentParser(description="BOM Tracker web + sync v" + VERSION)
     ap.add_argument("cmd", choices=["serve", "sync", "migrate"])
     ap.add_argument("--db", default=DEF_DB)
+    ap.add_argument("--watch", action="store_true", help="with 'sync': keep running and sync on change")
     ap.add_argument("--host", default="100.64.0.2")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--server", default="http://100.64.0.2:8787")
     a = ap.parse_args()
-    if a.cmd == "sync": return sync(a.db, a.server)
+    if a.cmd == "sync": return watch(a.db, a.server) if a.watch else sync(a.db, a.server)
     c = connect(a.db); migrate(c, a.db); c.close()
     if a.cmd == "migrate": return print("migrated", a.db)
     H.db = a.db

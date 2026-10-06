@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.0] - 2026-10-06
+
+### Added
+- **Live refresh** — the app notices when another connection changes the database (the
+  phone web app, the sync agent, or a second desktop instance) and reloads within about a
+  second, keeping your selected project and part. The reload waits until any open dialog is
+  closed. A brief "Updated from another device" message appears in the status bar.
+
+### Changed
+- The database connection now waits up to 3 s for a lock instead of failing immediately,
+  since the web app and sync agent write to the same file.
+
 ## [1.5.0] - 2026-10-05
 
 ### Added
