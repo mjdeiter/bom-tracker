@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.5.0] - 2026-10-05
+
+### Added
+- **Drag-and-drop import** — drop a `.md` BOM onto the window and the project and its
+  parts are created immediately (no dialog).
+- **Command-line import** — `bom-tracker file.md ...` imports then opens the app;
+  `bom-tracker --import file.md ...` imports headlessly (prints a summary, exit code 1 on
+  failure), handy for scripts.
+- **Smart re-import (sync)** — importing a BOM for a project that already exists no longer
+  creates a duplicate. New parts are added and *empty* fields (part #, vendor, URL, notes)
+  are filled in; quantity, price, status and anything you've typed are never overwritten.
+  A renamed project is recognised when >= 60% of the incoming parts already live in it.
+
+### Changed
+- **Unrecognised table columns are kept** — columns such as `Recommendation`, `Function`,
+  `Requirement` or `Material Recommendation` are now merged into the part's notes instead
+  of being dropped. Row-number columns (`#`, `No.`, `ID`) are ignored.
+- Tables with no recognisable name column are still imported if they look like a parts
+  table (they have Part #, Vendor, Qty, Price or URL columns); the first free column is
+  used as the name. Pinout / spec tables are skipped as before.
+- The Import dialog now goes through the same sync logic as drag-and-drop.
+
 ## [1.4.0] - 2026-06-29
 
 ### Added
