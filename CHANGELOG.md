@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.7.0] - 2026-10-07
+
+Pairs with `bom_web.py` 1.2.0.
+
+### Added
+- **Shop notes & blueprints** — every project has a **Notes** tab next to Parts. A note has a
+  title, a type (Shop Note, Blueprint, Wiring, Assembly, Safety or Reference) and plain text
+  that keeps its spacing, so ASCII sketches and wiring tables survive. Add, edit, delete,
+  search, and Copy Text.
+- **File attachments** — attach photos, PDFs, drawings or CAD files (up to 15 MB each) to a
+  note with **Attach File...** (native file picker, or paste a path). **Open** writes the file
+  to a private temp folder and hands it to your default viewer. Files are stored in the
+  database, so they sync to your other machines and are included in its backups.
+- **Notes in Print BOM** — notes and their attached file names are printed after the parts.
+- **Sync and phone** (`bom_web.py` 1.2.0) — notes and attachments sync like parts, and the
+  phone page has a Notes tab with upload from the camera or file picker.
+
+### Changed
+- The Delete Project confirmation now says the project's notes are deleted with it.
+- Update `bom_web.py` on every machine that syncs: older sync clients ignore notes and files.
+
+### Security
+- Opening an attachment never launches program or script types (`.sh`, `.desktop`, `.exe`,
+  and similar). They are saved to the temp folder and the path is shown instead.
+
 ## [1.6.0] - 2026-10-06
 
 ### Added

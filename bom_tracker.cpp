@@ -24,7 +24,7 @@
 #include <iomanip>
 #include <fstream>
 
-static const char* APP_VERSION = "1.6.0";
+static const char* APP_VERSION = "1.7.0";
 #ifndef BUILD_HASH
 #define BUILD_HASH "dev"
 #endif
@@ -335,12 +335,45 @@ struct Part {
     std::string section;
 };
 
+struct Attachment {
+    int         id      = 0;
+    int         note_id = 0;
+    std::string filename;
+    std::string mime;
+    long long   size    = 0;
+};
+
+// A shop note / blueprint / wiring sketch / safety sheet that belongs to a project.
+// `kind` is free text (the UI offers the NOTE_KINDS presets). Attached files are stored in
+// the database itself, so they travel with everything else when machines sync.
+struct Note {
+    int         id         = 0;
+    int         project_id = 0;
+    std::string title;
+    std::string kind;
+    std::string body;
+    std::vector<Attachment> files;
+};
+
 struct Project {
     int         id = 0;
     std::string name;
     std::string description;
     std::vector<Part> parts;
+    std::vector<Note> notes;
 };
+
+static const char* NOTE_KINDS[] = { "Shop Note", "Blueprint", "Wiring", "Assembly", "Safety", "Reference" };
+static const int   NOTE_KIND_COUNT = 6;
+static ImVec4 noteKindColor(const std::string& k){
+    if(k == "Blueprint") return COL_BLUE;
+    if(k == "Wiring")    return COL_YELLOW;
+    if(k == "Assembly")  return COL_GREEN;
+    if(k == "Safety")    return COL_RED;
+    if(k == "Reference") return COL_TEXT_DIM;
+    return COL_ACCENT;
+}
+static const long long MAX_ATTACH_BYTES = 15LL * 1024 * 1024;   // per attached file
 
 // ─── DB ─────────────────────────────────────────────────────────────────────
 static sqlite3*    g_db = nullptr;
@@ -408,6 +441,28 @@ static void db_init(){
     sqlite3_exec(g_db,
         "ALTER TABLE parts ADD COLUMN section TEXT NOT NULL DEFAULT '';",
         nullptr, nullptr, nullptr);
+
+    // Shop notes / blueprints and their attached files. The sync layer (bom_web.py)
+    // adds uuid / updated_at columns and triggers to these later, same as parts.
+    db_exec_one(R"(
+        CREATE TABLE IF NOT EXISTS notes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title      TEXT    NOT NULL DEFAULT '',
+            kind       TEXT    NOT NULL DEFAULT 'Shop Note',
+            body       TEXT    NOT NULL DEFAULT ''
+        );
+    )");
+    db_exec_one(R"(
+        CREATE TABLE IF NOT EXISTS attachments (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id  INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            filename TEXT    NOT NULL DEFAULT '',
+            mime     TEXT    NOT NULL DEFAULT 'application/octet-stream',
+            size     INTEGER NOT NULL DEFAULT 0,
+            data     BLOB    NOT NULL
+        );
+    )");
 }
 
 static std::vector<Project> g_projects;
@@ -446,6 +501,43 @@ static void db_load(){
         pt.section     = col_str(stmt, 10);
         for(auto& proj : g_projects)
             if(proj.id == pt.project_id){ proj.parts.push_back(std::move(pt)); break; }
+    }
+    sqlite3_finalize(stmt);
+
+    // Notes (file contents are NOT loaded here, only their names and sizes)
+    sqlite3_prepare_v2(g_db,
+        "SELECT id,project_id,title,kind,body FROM notes "
+        "ORDER BY kind COLLATE NOCASE, title COLLATE NOCASE, id",
+        -1, &stmt, nullptr);
+    while(sqlite3_step(stmt) == SQLITE_ROW){
+        Note n;
+        n.id         = sqlite3_column_int(stmt, 0);
+        n.project_id = sqlite3_column_int(stmt, 1);
+        n.title      = col_str(stmt, 2);
+        n.kind       = col_str(stmt, 3);
+        n.body       = col_str(stmt, 4);
+        for(auto& proj : g_projects)
+            if(proj.id == n.project_id){ proj.notes.push_back(std::move(n)); break; }
+    }
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(g_db,
+        "SELECT id,note_id,filename,mime,size FROM attachments "
+        "ORDER BY filename COLLATE NOCASE, id",
+        -1, &stmt, nullptr);
+    while(sqlite3_step(stmt) == SQLITE_ROW){
+        Attachment a;
+        a.id       = sqlite3_column_int(stmt, 0);
+        a.note_id  = sqlite3_column_int(stmt, 1);
+        a.filename = col_str(stmt, 2);
+        a.mime     = col_str(stmt, 3);
+        a.size     = sqlite3_column_int64(stmt, 4);
+        bool placed = false;
+        for(auto& proj : g_projects){
+            for(auto& n : proj.notes)
+                if(n.id == a.note_id){ n.files.push_back(a); placed = true; break; }
+            if(placed) break;
+        }
     }
     sqlite3_finalize(stmt);
 }
@@ -525,6 +617,150 @@ static void db_delete_part(int id){
     sqlite3_bind_int(stmt, 1, id);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+}
+
+// ─── Notes & attachments ─────────────────────────────────────────────────────
+static int db_insert_note(int project_id, const std::string& title,
+                          const std::string& kind, const std::string& body){
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(g_db,
+        "INSERT INTO notes(project_id,title,kind,body) VALUES(?,?,?,?)", -1, &stmt, nullptr);
+    sqlite3_bind_int (stmt, 1, project_id);
+    sqlite3_bind_text(stmt, 2, title.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, kind.c_str(),  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, body.c_str(),  -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return static_cast<int>(sqlite3_last_insert_rowid(g_db));
+}
+
+static void db_update_note(int id, const std::string& title,
+                           const std::string& kind, const std::string& body){
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(g_db,
+        "UPDATE notes SET title=?,kind=?,body=? WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, title.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, kind.c_str(),  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, body.c_str(),  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 4, id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void db_delete_note(int id){   // attached files go with it (ON DELETE CASCADE)
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(g_db, "DELETE FROM notes WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void db_delete_attachment(int id){
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(g_db, "DELETE FROM attachments WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static std::string human_size(long long n){
+    char b[32];
+    if(n < 1024)             snprintf(b, sizeof(b), "%lld B", n);
+    else if(n < 1024 * 1024) snprintf(b, sizeof(b), "%.0f KB", n / 1024.0);
+    else                     snprintf(b, sizeof(b), "%.1f MB", n / (1024.0 * 1024.0));
+    return b;
+}
+
+static std::string guess_mime(const std::string& filename){
+    std::string ext = std::filesystem::path(filename).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c){ return std::tolower(c); });
+    if(ext == ".png")                   return "image/png";
+    if(ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if(ext == ".gif")                   return "image/gif";
+    if(ext == ".webp")                  return "image/webp";
+    if(ext == ".svg")                   return "image/svg+xml";
+    if(ext == ".pdf")                   return "application/pdf";
+    if(ext == ".txt" || ext == ".md")   return "text/plain";
+    if(ext == ".csv")                   return "text/csv";
+    return "application/octet-stream";
+}
+
+// Read a file from disk into the attachments table. Returns false and sets err on failure.
+static bool db_add_attachment(int note_id, std::string path, std::string& err){
+    namespace fs = std::filesystem;
+    // tolerate pasted paths: surrounding spaces / quotes, and a leading ~/
+    while(!path.empty() && (path.back() == ' ' || path.back() == '\n' || path.back() == '\r')) path.pop_back();
+    while(!path.empty() && path.front() == ' ') path.erase(path.begin());
+    if(path.size() >= 2 && (path.front() == '"' || path.front() == '\'') && path.back() == path.front())
+        path = path.substr(1, path.size() - 2);
+    if(path.size() >= 2 && path[0] == '~' && path[1] == '/'){
+        const char* home = getenv("HOME");
+        if(home) path = std::string(home) + path.substr(1);
+    }
+    std::error_code ec;
+    if(path.empty() || !fs::is_regular_file(path, ec)){ err = "Not a file: " + path; return false; }
+    uintmax_t sz = fs::file_size(path, ec);
+    if(ec){ err = "Cannot read file size"; return false; }
+    if(sz == 0){ err = "File is empty"; return false; }
+    if(sz > static_cast<uintmax_t>(MAX_ATTACH_BYTES)){
+        err = "File is " + human_size(static_cast<long long>(sz)) + " (limit " + human_size(MAX_ATTACH_BYTES) + ")";
+        return false;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if(!in){ err = "Cannot open file"; return false; }
+    std::string data(static_cast<size_t>(sz), '\0');
+    in.read(&data[0], static_cast<std::streamsize>(sz));
+    if(static_cast<uintmax_t>(in.gcount()) != sz){ err = "Short read"; return false; }
+
+    std::string name = fs::path(path).filename().string();
+    std::string mime = guess_mime(name);
+    sqlite3_stmt* stmt = nullptr;
+    if(sqlite3_prepare_v2(g_db,
+        "INSERT INTO attachments(note_id,filename,mime,size,data) VALUES(?,?,?,?,?)",
+        -1, &stmt, nullptr) != SQLITE_OK){ err = sqlite3_errmsg(g_db); return false; }
+    sqlite3_bind_int  (stmt, 1, note_id);
+    sqlite3_bind_text (stmt, 2, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (stmt, 3, mime.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(sz));
+    sqlite3_bind_blob (stmt, 5, data.data(), static_cast<int>(data.size()), SQLITE_TRANSIENT);
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    if(!ok) err = sqlite3_errmsg(g_db);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+// Write an attachment to a private temp folder and return its path ("" + err on failure),
+// so it can be handed to the system's default viewer.
+static std::string db_extract_attachment(int id, std::string& err){
+    namespace fs = std::filesystem;
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(g_db, "SELECT filename,data FROM attachments WHERE id=?", -1, &stmt, nullptr);
+    sqlite3_bind_int(stmt, 1, id);
+    std::string name, data, out;
+    if(sqlite3_step(stmt) == SQLITE_ROW){
+        name = col_str(stmt, 0);
+        const void* blob = sqlite3_column_blob(stmt, 1);
+        int len = sqlite3_column_bytes(stmt, 1);
+        if(blob && len > 0) data.assign(static_cast<const char*>(blob), static_cast<size_t>(len));
+    }
+    sqlite3_finalize(stmt);
+    if(data.empty()){ err = "Attachment not found"; return ""; }
+
+    for(auto& c : name)   // keep it a plain file name: no separators or odd characters
+        if(!isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != '_' && c != ' ') c = '_';
+    while(!name.empty() && name.front() == '.') name.erase(name.begin());
+    if(name.empty()) name = "attachment";
+
+    std::error_code ec;
+    fs::path dir = fs::temp_directory_path(ec) / ("bom-tracker-" + std::to_string(getuid()));
+    fs::create_directories(dir, ec);
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+    fs::path p = dir / (std::to_string(id) + "_" + name);
+    std::ofstream o(p, std::ios::binary | std::ios::trunc);
+    if(!o){ err = "Cannot write " + p.string(); return ""; }
+    o.write(data.data(), static_cast<std::streamsize>(data.size()));
+    o.close();
+    return p.string();
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1044,6 +1280,12 @@ static void export_bom_html(const Project& proj){
         ".num{text-align:right}\n"
         ".sn{color:#888}.so{color:#b8960a}.si{color:#2a7a35}.sa{color:#2255aa}\n"
         ".tr td{font-weight:bold;border-top:2px solid #222;background:#f0f0f0}\n"
+        ".note{margin-top:14px;page-break-inside:avoid}\n"
+        "h2{font-size:15px;margin:22px 0 4px;border-bottom:2px solid #222}\n"
+        ".note h3{font-size:13px;margin:0 0 4px}.kind{color:#888;font-weight:normal;font-size:11px}\n"
+        ".note pre{white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;"
+        "background:#f7f7f7;border:1px solid #ddd;padding:8px;margin:0}\n"
+        ".files{color:#666;font-size:11px;margin:4px 0 0}\n"
         "@media print{body{margin:12px}}\n"
         "</style>\n</head>\n<body>\n"
         "<h1>Bill of Materials \xe2\x80\x94 %s</h1>\n",
@@ -1087,12 +1329,39 @@ static void export_bom_html(const Project& proj){
         "<tr class=\"tr\">"
         "<td colspan=\"6\" style=\"text-align:right\">Total (excl. tax &amp; shipping):</td>"
         "<td class=\"num\">%s</td><td colspan=\"2\"></td></tr>\n"
-        "</tfoot>\n</table>\n"
+        "</tfoot>\n</table>\n",
+        format_price(grand, false).c_str());
+
+    // Shop notes / blueprints go after the parts so the shop copy carries safety rules and wiring too
+    if(!proj.notes.empty()){
+        auto esc_t = [](const std::string& s) -> std::string {   // text only: leave quotes alone
+            std::string o; o.reserve(s.size());
+            for(char c : s){
+                if(c=='&') o+="&amp;"; else if(c=='<') o+="&lt;"; else if(c=='>') o+="&gt;"; else o+=c;
+            }
+            return o;
+        };
+        fprintf(f, "<h2>Notes</h2>\n");
+        for(auto& n : proj.notes){
+            fprintf(f, "<div class=\"note\"><h3>%s <span class=\"kind\">%s</span></h3>\n",
+                    esc_t(n.title).c_str(), esc_t(n.kind).c_str());
+            if(!n.body.empty()) fprintf(f, "<pre>%s</pre>\n", esc_t(n.body).c_str());
+            if(!n.files.empty()){
+                fprintf(f, "<p class=\"files\">Attached files: ");
+                for(size_t i = 0; i < n.files.size(); i++)
+                    fprintf(f, "%s%s", i ? ", " : "", esc_t(n.files[i].filename).c_str());
+                fprintf(f, "</p>\n");
+            }
+            fprintf(f, "</div>\n");
+        }
+    }
+
+    fprintf(f,
         "<p style=\"color:#888;font-size:10px;margin-top:12px\">"
         "Generated by BOM Tracker &mdash; %zu part(s)</p>\n"
         "<script>window.onload=function(){window.print()}</script>\n"
         "</body>\n</html>\n",
-        format_price(grand, false).c_str(), proj.parts.size());
+        proj.parts.size());
 
     fclose(f);
     open_url("file://" + path);
@@ -1265,6 +1534,304 @@ static void draw_project_list(){
     ImGui::PopStyleColor();
 }
 
+// ─── Notes tab: shop notes, blueprints, attached files ───────────────────────
+static int         g_sel_note_id      = -1;
+static char        g_note_title[256]  = {};
+static int         g_note_kind        = 0;      // index into NOTE_KINDS (or NOTE_KIND_COUNT = custom)
+static std::string g_note_kind_extra;           // a kind that isn't one of the presets
+static std::string g_note_body;
+static char        g_note_search[256] = {};
+static char        g_attach_path[1024]= {};
+static std::string g_attach_err;
+static int         g_del_att_id       = -1;
+static std::string g_del_att_name;
+static bool g_show_add_note  = false;
+static bool g_show_edit_note = false;
+static bool g_show_del_note  = false;
+static bool g_show_attach    = false;
+static bool g_show_del_att   = false;
+
+static const char* note_kind_name(int i){
+    return i < NOTE_KIND_COUNT ? NOTE_KINDS[i] : g_note_kind_extra.c_str();
+}
+
+// Multiline input bound to a std::string (grows as you type; same approach as imgui_stdlib)
+static int note_input_resize_cb(ImGuiInputTextCallbackData* d){
+    if(d->EventFlag == ImGuiInputTextFlags_CallbackResize){
+        std::string* s = static_cast<std::string*>(d->UserData);
+        s->resize(static_cast<size_t>(d->BufTextLen));
+        d->Buf = const_cast<char*>(s->c_str());
+    }
+    return 0;
+}
+static bool input_multiline_str(const char* label, std::string& s, ImVec2 size){
+    return ImGui::InputTextMultiline(label, const_cast<char*>(s.c_str()), s.capacity() + 1, size,
+        ImGuiInputTextFlags_CallbackResize, note_input_resize_cb, &s);
+}
+
+// Native "choose a file" dialog for attachments (any file type). "" if cancelled / unavailable.
+static std::string pick_any_file(){
+#ifdef __APPLE__
+    {
+        FILE* fp = popen("osascript -e 'POSIX path of (choose file with prompt \"Attach a file\")' 2>/dev/null", "r");
+        if(!fp) return "";
+        char buf[1024]={};
+        fgets(buf, sizeof(buf), fp);
+        pclose(fp);
+        std::string s(buf);
+        if(!s.empty() && s.back()=='\n') s.pop_back();
+        return s;
+    }
+#endif
+    struct { const char* bin; const char* cmd; } tools[] = {
+        { "kdialog", "kdialog --getopenfilename \"$HOME\"" },
+        { "zenity",  "zenity --file-selection --title='Attach a file'" },
+    };
+    for(auto& t : tools){
+        std::string chk = std::string("which ") + t.bin + " >/dev/null 2>&1";
+        if(system(chk.c_str()) != 0) continue;
+        FILE* fp = popen((std::string(t.cmd) + " 2>/dev/null").c_str(), "r");
+        if(!fp) continue;
+        char buf[1024]={};
+        fgets(buf, sizeof(buf), fp);
+        pclose(fp);
+        std::string s(buf);
+        if(!s.empty() && s.back()=='\n') s.pop_back();
+        if(!s.empty()) return s;
+    }
+    return "";
+}
+
+static void begin_note_edit(const Note* n){
+    memset(g_note_title, 0, sizeof(g_note_title));
+    g_note_kind_extra.clear();
+    g_note_body.clear();
+    g_note_kind = 0;
+    if(!n) return;
+    strncpy(g_note_title, n->title.c_str(), sizeof(g_note_title)-1);
+    g_note_body = n->body;
+    g_note_kind = -1;
+    for(int i = 0; i < NOTE_KIND_COUNT; i++)
+        if(n->kind == NOTE_KINDS[i]){ g_note_kind = i; break; }
+    if(g_note_kind < 0){            // keep an unknown kind (e.g. typed on the phone) as it is
+        g_note_kind_extra = n->kind;
+        g_note_kind = NOTE_KIND_COUNT;
+    }
+}
+
+static void draw_note_form(){
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+    ImGui::TextUnformatted("Title *");
+    ImGui::PopStyleColor();
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##ntitle", g_note_title, sizeof(g_note_title));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+    ImGui::TextUnformatted("Type");
+    ImGui::PopStyleColor();
+    ImGui::SetNextItemWidth(-1);
+    int n_items = NOTE_KIND_COUNT + (g_note_kind_extra.empty() ? 0 : 1);
+    if(ImGui::BeginCombo("##nkind", note_kind_name(g_note_kind))){
+        for(int i = 0; i < n_items; i++){
+            bool is_sel = (i == g_note_kind);
+            if(ImGui::Selectable(note_kind_name(i), is_sel)) g_note_kind = i;
+            if(is_sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+    ImGui::TextUnformatted("Note  (plain text; spacing is kept, so ASCII sketches and wiring tables work)");
+    ImGui::PopStyleColor();
+    input_multiline_str("##nbody", g_note_body, {-1, 300});
+}
+
+// File types that run code when opened. An attachment can arrive by sync from any device on the
+// tailnet, so these are saved to the temp folder but never handed to the system opener.
+static bool is_runnable_type(const std::string& filename){
+    std::string ext = std::filesystem::path(filename).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c){ return std::tolower(c); });
+    static const char* RUN[] = { ".desktop", ".sh", ".bash", ".zsh", ".command", ".run", ".appimage",
+        ".bin", ".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".ps1", ".vbs", ".jar", ".jnlp",
+        ".scpt", ".app", ".workflow", ".terminal" };
+    for(const char* r : RUN) if(ext == r) return true;
+    return false;
+}
+
+static void open_attachment(const Attachment& f){
+    std::string err;
+    std::string path = db_extract_attachment(f.id, err);
+    if(path.empty()) g_status_msg = "Open failed: " + err;
+    else if(is_runnable_type(f.filename)) g_status_msg = "Not opened (program or script file). Saved to " + path;
+    else { open_url(path); g_status_msg = "Opened " + f.filename; }
+    g_status_time = glfwGetTime();
+}
+
+static void draw_notes_tab(Project& proj){
+    std::string needle = to_lower_str(g_note_search);
+    auto matches = [&](const Note& n){
+        if(needle.empty()) return true;
+        return to_lower_str(n.title + " " + n.kind + " " + n.body).find(needle) != std::string::npos;
+    };
+
+    // Selected note (by id, so it survives reloads); fall back to the first visible one
+    Note* sel = nullptr;
+    for(auto& n : proj.notes) if(n.id == g_sel_note_id && matches(n)){ sel = &n; break; }
+    if(!sel)
+        for(auto& n : proj.notes) if(matches(n)){ sel = &n; g_sel_note_id = n.id; break; }
+
+    // ── Toolbar ──
+    push_accent_style();
+    if(ImGui::Button("+ Add Note")){
+        begin_note_edit(nullptr);
+        g_show_add_note = true;
+    }
+    pop_accent_style();
+    ImGui::SameLine();
+    if(!sel) ImGui::BeginDisabled();
+    push_accent_style();
+    if(ImGui::Button("Edit") && sel){
+        begin_note_edit(sel);
+        g_show_edit_note = true;
+    }
+    ImGui::SameLine();
+    if(ImGui::Button("Attach File...") && sel){
+        memset(g_attach_path, 0, sizeof(g_attach_path));
+        g_attach_err.clear();
+        g_show_attach = true;
+    }
+    pop_accent_style();
+    ImGui::SameLine();
+    if(ImGui::Button("Copy Text") && sel){
+        ImGui::SetClipboardText(sel->body.c_str());
+        g_status_msg = "Note text copied";
+        g_status_time = glfwGetTime();
+    }
+    ImGui::SameLine();
+    push_danger_style();
+    if(ImGui::Button("Delete") && sel) g_show_del_note = true;
+    pop_danger_style();
+    if(!sel) ImGui::EndDisabled();
+
+    float search_w = 220.0f;
+    float avail    = ImGui::GetContentRegionAvail().x;
+    ImGui::SameLine(ImGui::GetCursorPosX() + avail - search_w - 8);
+    ImGui::SetNextItemWidth(search_w);
+    ImGui::InputTextWithHint("##nsearch", "Search notes...", g_note_search, sizeof(g_note_search));
+    ImGui::Spacing();
+
+    // ── Note list (left) ──
+    float list_w = std::clamp(ImGui::GetContentRegionAvail().x * 0.32f, 200.0f, 340.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, COL_PANEL);
+    ImGui::BeginChild("##note_list", {list_w, 0}, true);
+    int shown = 0;
+    for(auto& n : proj.notes){
+        if(!matches(n)) continue;
+        shown++;
+        bool is_sel = (sel && n.id == sel->id);
+        ImGui::PushID(n.id);
+        if(is_sel){
+            ImGui::PushStyleColor(ImGuiCol_Header,        COL_SEL_BG);
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, COL_SEL_BG);
+        }
+        float line_h = ImGui::GetTextLineHeight();
+        if(ImGui::Selectable("##notesel", is_sel, 0, {0, line_h * 2 + 6}))
+            g_sel_note_id = n.id;
+        if(is_sel) ImGui::PopStyleColor(2);
+        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect({a.x, a.y}, {b.x - 2, b.y}, true);
+        std::string tag = n.kind.empty() ? "Note" : n.kind;
+        if(!n.files.empty()) tag += "  [" + std::to_string(n.files.size()) +
+                                    (n.files.size() == 1 ? " file]" : " files]");
+        dl->AddText({a.x + 6, a.y + 2}, ImGui::GetColorU32(noteKindColor(n.kind)), tag.c_str());
+        dl->AddText({a.x + 6, a.y + 2 + line_h}, ImGui::GetColorU32(COL_TEXT), n.title.c_str());
+        dl->PopClipRect();
+        ImGui::PopID();
+    }
+    if(shown == 0){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextWrapped(proj.notes.empty() ? "No notes yet." : "No matches.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+
+    // ── Note viewer (right) ──
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, COL_PANEL);
+    ImGui::BeginChild("##note_view", {0, 0}, true);
+    if(!sel){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(proj.notes.empty()
+            ? "No notes yet.\n\nUse + Add Note for shop notes, wiring sketches, assembly steps or safety rules, "
+              "then Attach File... to keep a blueprint, photo or PDF with the note."
+            : "Select a note.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+        ImGui::TextUnformatted(sel->title.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, noteKindColor(sel->kind));
+        ImGui::Text("  [%s]", sel->kind.empty() ? "Note" : sel->kind.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+
+        float att_h = 0.0f;
+        if(!sel->files.empty())
+            att_h = std::min(160.0f, ImGui::GetFrameHeightWithSpacing() * static_cast<float>(sel->files.size())
+                                     + ImGui::GetTextLineHeightWithSpacing() + 16.0f);
+        ImGui::BeginChild("##note_body", {0, att_h > 0 ? -(att_h + 6.0f) : 0.0f}, false);
+        if(sel->body.empty()){
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+            ImGui::TextUnformatted("(no text)");
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(sel->body.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::EndChild();
+
+        if(!sel->files.empty()){
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT_DIM);
+            ImGui::TextUnformatted("ATTACHED FILES");
+            ImGui::PopStyleColor();
+            ImGui::BeginChild("##note_files", {0, 0}, false);
+            for(auto& f : sel->files){
+                ImGui::PushID(f.id);
+                ImGui::TextUnformatted(f.filename.c_str());
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+                ImGui::Text("(%s)", human_size(f.size).c_str());
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                push_accent_style();
+                if(ImGui::SmallButton("Open")) open_attachment(f);
+                pop_accent_style();
+                ImGui::SameLine();
+                push_danger_style();
+                if(ImGui::SmallButton("Remove")){
+                    g_del_att_id   = f.id;
+                    g_del_att_name = f.filename;
+                    g_show_del_att = true;
+                }
+                pop_danger_style();
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+static void draw_parts_tab(Project& proj);
+
 // ─── Parts panel (right area) ────────────────────────────────────────────────
 static void draw_parts_panel(){
     if(g_sel_project < 0 || g_sel_project >= static_cast<int>(g_projects.size())){
@@ -1309,6 +1876,22 @@ static void draw_parts_panel(){
     ImGui::Separator();
     ImGui::Spacing();
 
+    if(ImGui::BeginTabBar("##proj_tabs")){
+        if(ImGui::BeginTabItem("Parts")){
+            draw_parts_tab(proj);
+            ImGui::EndTabItem();
+        }
+        std::string notes_label = "Notes (" + std::to_string(proj.notes.size()) + ")###notes_tab";
+        if(ImGui::BeginTabItem(notes_label.c_str())){
+            draw_notes_tab(proj);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+// ─── Parts tab (toolbar, table, footer) ──────────────────────────────────────
+static void draw_parts_tab(Project& proj){
     // ── Toolbar ──
     push_accent_style();
     if(ImGui::Button("+ Add Part")){
@@ -1808,6 +2391,11 @@ static void draw_modals(){
     if(g_show_del_part)     { ImGui::OpenPopup("Delete Part?");    g_show_del_part     = false; }
     if(g_show_about)        { ImGui::OpenPopup("About##dlg");      g_show_about        = false; }
     if(g_show_import_md)    { ImGui::OpenPopup("Import from Markdown"); g_show_import_md = false; }
+    if(g_show_add_note)     { ImGui::OpenPopup("Add Note");        g_show_add_note     = false; }
+    if(g_show_edit_note)    { ImGui::OpenPopup("Edit Note");       g_show_edit_note    = false; }
+    if(g_show_del_note)     { ImGui::OpenPopup("Delete Note?");    g_show_del_note     = false; }
+    if(g_show_attach)       { ImGui::OpenPopup("Attach File");     g_show_attach       = false; }
+    if(g_show_del_att)      { ImGui::OpenPopup("Remove File?");    g_show_del_att      = false; }
 
     // ── Add Project ──
     if(begin_modal("Add Project")){
@@ -1874,7 +2462,7 @@ static void draw_modals(){
         ImGui::PopStyleColor();
         ImGui::Separator(); ImGui::Spacing();
         if(g_sel_project >= 0 && g_sel_project < static_cast<int>(g_projects.size()))
-            ImGui::TextWrapped("Delete \"%s\" and ALL its parts? This cannot be undone.",
+            ImGui::TextWrapped("Delete \"%s\" and ALL its parts and notes? This cannot be undone.",
                 g_projects[g_sel_project].name.c_str());
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
         push_danger_style();
@@ -1976,6 +2564,151 @@ static void draw_modals(){
         if(ImGui::Button("Delete", {120,0}) && g_sel_project >= 0 && g_sel_part >= 0){
             db_delete_part(g_projects[g_sel_project].parts[g_sel_part].id);
             g_sel_part = -1; g_sel_part_id = -1;
+            db_load(); resolve_sel_part();
+            ImGui::CloseCurrentPopup();
+        }
+        pop_danger_style();
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel", {80,0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ── Add Note ──
+    if(begin_modal("Add Note", {720,0})){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+        ImGui::TextUnformatted("ADD NOTE");
+        ImGui::PopStyleColor();
+        ImGui::Separator(); ImGui::Spacing();
+        draw_note_form();
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        bool can_add = g_note_title[0] != '\0' && g_sel_project >= 0;
+        if(!can_add) ImGui::BeginDisabled();
+        push_accent_style();
+        if(ImGui::Button("Add", {120,0})){
+            int new_id = db_insert_note(g_projects[g_sel_project].id, g_note_title,
+                                        note_kind_name(g_note_kind), g_note_body);
+            g_sel_note_id = new_id;
+            db_load(); resolve_sel_part();
+            ImGui::CloseCurrentPopup();
+        }
+        pop_accent_style();
+        if(!can_add) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel", {80,0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ── Edit Note ──
+    if(begin_modal("Edit Note", {720,0})){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+        ImGui::TextUnformatted("EDIT NOTE");
+        ImGui::PopStyleColor();
+        ImGui::Separator(); ImGui::Spacing();
+        draw_note_form();
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        bool can_save = g_note_title[0] != '\0' && g_sel_note_id >= 0;
+        if(!can_save) ImGui::BeginDisabled();
+        push_accent_style();
+        if(ImGui::Button("Save", {120,0})){
+            db_update_note(g_sel_note_id, g_note_title, note_kind_name(g_note_kind), g_note_body);
+            db_load(); resolve_sel_part();
+            ImGui::CloseCurrentPopup();
+        }
+        pop_accent_style();
+        if(!can_save) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel", {80,0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ── Delete Note ──
+    if(begin_modal("Delete Note?", {420,0})){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_RED);
+        ImGui::TextUnformatted("DELETE NOTE");
+        ImGui::PopStyleColor();
+        ImGui::Separator(); ImGui::Spacing();
+        const Note* dn = nullptr;
+        if(g_sel_project >= 0 && g_sel_project < static_cast<int>(g_projects.size()))
+            for(auto& n : g_projects[g_sel_project].notes) if(n.id == g_sel_note_id){ dn = &n; break; }
+        if(dn){
+            ImGui::TextWrapped("Delete \"%s\"%s? This cannot be undone.", dn->title.c_str(),
+                dn->files.empty() ? "" : (" and its " + std::to_string(dn->files.size()) +
+                                          (dn->files.size() == 1 ? " attached file" : " attached files")).c_str());
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        push_danger_style();
+        if(ImGui::Button("Delete", {120,0}) && dn){
+            db_delete_note(dn->id);
+            g_sel_note_id = -1;
+            db_load(); resolve_sel_part();
+            ImGui::CloseCurrentPopup();
+        }
+        pop_danger_style();
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel", {80,0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ── Attach File ──
+    if(begin_modal("Attach File", {600,0})){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+        ImGui::TextUnformatted("ATTACH FILE");
+        ImGui::PopStyleColor();
+        ImGui::Separator(); ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextUnformatted("File path");
+        ImGui::PopStyleColor();
+        ImGui::SetNextItemWidth(-100);
+        ImGui::InputText("##attpath", g_attach_path, sizeof(g_attach_path));
+        ImGui::SameLine();
+        if(ImGui::Button("Browse...", {90,0})){
+            std::string p = pick_any_file();
+            if(!p.empty()){ strncpy(g_attach_path, p.c_str(), sizeof(g_attach_path)-1); g_attach_err.clear(); }
+        }
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::TextWrapped("Photos, PDFs, drawings, CAD files: up to %s each. Files are stored in the "
+                           "database and sync to your other machines.", human_size(MAX_ATTACH_BYTES).c_str());
+        ImGui::PopStyleColor();
+        if(!g_attach_err.empty()){
+            ImGui::PushStyleColor(ImGuiCol_Text, COL_RED);
+            ImGui::TextWrapped("%s", g_attach_err.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        bool can_attach = g_attach_path[0] != '\0' && g_sel_note_id >= 0;
+        if(!can_attach) ImGui::BeginDisabled();
+        push_accent_style();
+        if(ImGui::Button("Attach", {120,0})){
+            std::string err;
+            if(db_add_attachment(g_sel_note_id, g_attach_path, err)){
+                db_load(); resolve_sel_part();
+                g_status_msg  = "File attached";
+                g_status_time = glfwGetTime();
+                ImGui::CloseCurrentPopup();
+            } else {
+                g_attach_err = err;
+            }
+        }
+        pop_accent_style();
+        if(!can_attach) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel", {80,0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ── Remove Attachment ──
+    if(begin_modal("Remove File?", {400,0})){
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_RED);
+        ImGui::TextUnformatted("REMOVE FILE");
+        ImGui::PopStyleColor();
+        ImGui::Separator(); ImGui::Spacing();
+        ImGui::TextWrapped("Remove \"%s\" from this note? This cannot be undone.", g_del_att_name.c_str());
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        push_danger_style();
+        if(ImGui::Button("Remove", {120,0}) && g_del_att_id >= 0){
+            db_delete_attachment(g_del_att_id);
+            g_del_att_id = -1;
             db_load(); resolve_sel_part();
             ImGui::CloseCurrentPopup();
         }

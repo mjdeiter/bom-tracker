@@ -26,7 +26,10 @@ Also has a phone-friendly web UI and live sync between machines: see [WEB.md](WE
 - **Sortable table** — click any column header to sort (section grouping preserved)
 - **Search** — filter parts by name, part number, vendor, notes, or URL
 - **One-click URLs** — double-click any part row (or use Open URL button) to open in browser
-- **Print BOM** — generates a print-ready HTML file for the selected project
+- **Print BOM** — generates a print-ready HTML file for the selected project (notes included)
+- **Shop notes & blueprints** — a Notes tab per project for wiring, assembly and safety notes
+  (plain text, spacing kept), with photos, PDFs and drawings attached (up to 15 MB each);
+  they sync to your other machines and the phone page
 - **Persistent storage** — SQLite3 database at `~/.local/share/bom-tracker/bom.db`
 - **Embedded icon** — gold BOM-themed icon in both window title bar and taskbar
 - **Keyboard shortcut** — `Ctrl+N` to create a new project
@@ -112,6 +115,7 @@ Column aliases recognised: `Item`, `Component`, `Material` → Part Name; `SKU`,
 ## Data
 
 Database lives at `~/.local/share/bom-tracker/bom.db` — plain SQLite3, back it up or inspect it with any SQLite browser.
+Attached files are stored in it too, so it grows with them.
 
 ## License
 
