@@ -1455,7 +1455,7 @@ static void draw_parts_panel(){
                     ImGui::GetColorU32(COL_HEADER_BG));
                 ImGui::TableSetColumnIndex(0);
                 ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT_DIM);
-                ImGui::TextUnformatted(("  â¸  " + pt.section).c_str());
+                ImGui::TextUnformatted(("  >  " + pt.section).c_str());
                 ImGui::PopStyleColor();
             }
 
